@@ -61,10 +61,5 @@ fidata: non esporre direttamente il gioco su Internet.
 
 Per fermare il gioco, tornare al terminale e premere `Ctrl+C`.
 
-## Documentazione
-
-I dettagli per sviluppo, produzione, test, architettura e dati geografici sono nella
-[documentazione tecnica](docs/README.md).
-
 La mappa usa dati **© OpenStreetMap contributors**, disponibili con licenza
 [ODbL](https://www.openstreetmap.org/copyright).
