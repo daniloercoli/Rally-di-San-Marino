@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Rally San Marino</title>
+<link rel="icon" type="image/png" sizes="64x64" href="/favicon.png" />
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0d1117; font-family: 'Segoe UI', system-ui, sans-serif; color: #e6edf3; }
+  #app { position: fixed; inset: 0; }
+  canvas { display: block; }
+  .hud { position: fixed; z-index: 10; pointer-events: none; }
+  #standings { top: 12px; right: 12px; background: rgba(13,17,23,.75); border: 1px solid #30363d; border-radius: 8px; padding: 10px 14px; min-width: min(430px, calc(100vw - 52px)); }
+  #standings .row { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; line-height: 1.6; }
+  #standings .row > span:last-child { text-align: right; }
+  #standings .row.me { color: #ffb020; font-weight: 600; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }  #speed { bottom: 14px; left: 14px; font-size: 42px; font-weight: 700; text-shadow: 0 2px 8px #000; }
+  #speed small { font-size: 16px; font-weight: 400; color: #8b949e; }
+  #cp { bottom: 20px; left: 150px; font-size: 15px; color: #8b949e; }
+  #warn { bottom: 72px; left: 14px; font-size: 18px; font-weight: 700; color: #ff5555; display: none; animation: blink .5s infinite alternate; }
+  #handbrake { bottom: 98px; left: 14px; font-size: 14px; font-weight: 700; color: #ffb020; display: none; }
+  @keyframes blink { from { opacity: .4; } to { opacity: 1; } }
+  #start-signal { top: 20%; left: 0; right: 0; display: none; flex-direction: column; align-items: center; gap: 16px; }
+  #start-lights { display: flex; gap: clamp(7px, 2.5vw, 14px); padding: 14px 18px; border: 2px solid #30363d; border-radius: 18px; background: rgba(5,8,12,.9); box-shadow: 0 6px 24px #000; }
+  .start-light { width: clamp(34px, 10vw, 58px); height: clamp(34px, 10vw, 58px); border-radius: 50%; background: #260809; border: 3px solid #4a1b1d; box-shadow: inset 0 0 14px #000; }
+  .start-light.red { background: #ff2424; border-color: #ff7373; box-shadow: 0 0 22px #ff1e1e, inset 0 0 8px #fff; }
+  #start-go { display: none; font-size: 64px; font-weight: 900; color: #42ff6e; text-shadow: 0 0 22px #16d947, 0 4px 18px #000; }
+  #info { top: 12px; left: 12px; background: rgba(13,17,23,.75); border: 1px solid #30363d; border-radius: 8px; padding: 8px 14px; font-size: 13px; color: #8b949e; line-height: 1.6; }
+  #info b { color: #e6edf3; }
+  #timer { top: 10px; left: 0; right: 0; text-align: center; font-size: 30px; font-weight: 700; text-shadow: 0 2px 8px #000; font-variant-numeric: tabular-nums; }
+  #street-name { top: 54px; left: 50%; display: none; transform: translateX(-50%); max-width: min(70vw, 620px); overflow: hidden; padding: 7px 18px; border: 1px solid rgba(255,176,32,.55); border-radius: 999px; background: rgba(13,17,23,.82); color: #f6f0e5; font-size: 18px; font-weight: 650; text-align: center; text-overflow: ellipsis; white-space: nowrap; box-shadow: 0 4px 16px rgba(0,0,0,.35); }
+  #turn-cue { top: 96px; left: 50%; display: none; transform: translateX(-50%); text-align: center; }
+  #turn-cue .cue-card { display: grid; justify-items: center; min-width: 132px; padding: 8px 16px 10px; border: 2px solid #ffb020; border-radius: 16px; background: rgba(8,11,16,.82); box-shadow: 0 5px 22px rgba(0,0,0,.5), inset 0 0 20px rgba(255,176,32,.08); animation: turn-cue-in .14s ease-out; }
+  #turn-cue svg { width: 92px; height: 78px; overflow: visible; }
+  #turn-cue[data-turn='right'] svg { transform: scaleX(-1); }
+  #turn-cue-path { fill: none; stroke: #ffd166; stroke-width: 10; stroke-linecap: round; stroke-linejoin: round; }
+  #turn-cue[data-severity='open'] .cue-card { border-color: #8bdc8b; }
+  #turn-cue[data-severity='open'] #turn-cue-path { stroke: #a8efa8; }
+  #turn-cue[data-severity='tight'] .cue-card { border-color: #ff8c42; }
+  #turn-cue[data-severity='tight'] #turn-cue-path { stroke: #ff9c56; }
+  #turn-cue[data-severity='hairpin'] .cue-card { border-color: #ff5555; box-shadow: 0 5px 24px rgba(255,50,50,.3); }
+  #turn-cue[data-severity='hairpin'] #turn-cue-path { stroke: #ff6b6b; }
+  #turn-cue-label { margin-top: 2px; font-size: 19px; font-weight: 800; letter-spacing: .02em; text-transform: uppercase; text-shadow: 0 2px 8px #000; }
+  @keyframes turn-cue-in { from { opacity: 0; transform: translateY(-8px) scale(.9); } to { opacity: 1; transform: translateY(0) scale(1); } }
+  #minimap { right: 12px; bottom: 12px; width: 240px; height: 180px; background: rgba(13,17,23,.8); border: 1px solid #30363d; border-radius: 8px; }
+  #join { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: #0d1117; z-index: 20; }
+  #join .card { width: min(420px, calc(100vw - 36px)); text-align: center; }
+  #join h1 { font-size: 34px; margin: 0 0 6px; }
+  #join p { color: #8b949e; margin: 0 0 18px; }
+  #join button { pointer-events: auto; font-size: 18px; padding: 10px 26px; border-radius: 8px; border: 1px solid #30363d; background: #21262d; color: #e6edf3; cursor: pointer; }
+  #join button:hover { background: #30363d; }
+  #join button:disabled { opacity: .5; cursor: default; }
+  #route-select { width: 100%; padding: 8px; border: 1px solid #30363d; border-radius: 6px; background: #0d1117; color: #e6edf3; margin-top: 8px; }
+  #route-hint { display: block; max-width: 360px; margin-top: 5px; color: #8b949e; font-size: 12px; text-align: left; }
+  #lobby-controls { display: none; margin-top: 16px; }
+  #lobby-players { display: grid; gap: 6px; margin: 12px 0; text-align: left; }
+  #lobby-players .player { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 10px; border: 1px solid #30363d; border-radius: 7px; background: #161b22; }
+  #lobby-players .identity { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #lobby-players .state { color: #8b949e; font-size: 13px; }
+  #lobby-players .state.ready { color: #42ff6e; }
+  #lobby-actions { display: flex; justify-content: center; gap: 8px; }
+  #lobby-actions button { font-size: 15px; padding: 8px 16px; }
+  #lobby-status { display: block; min-height: 18px; margin-top: 10px; color: #8b949e; font-size: 13px; }
+</style>
+</head><body>
+<div id="app"></div>
+<div class="hud" id="info">Percorso: <b id="route-info">…</b> · <span id="best"></span><br />WASD / frecce per guidare · Spazio: freno a mano</div>
+<div class="hud" id="timer"></div>
+<div class="hud" id="street-name" role="status" aria-live="polite"></div>
+<div class="hud" id="turn-cue" role="status" aria-live="polite" aria-atomic="true">
+  <div class="cue-card">
+    <svg viewBox="0 0 100 105" aria-hidden="true">
+      <defs>
+        <marker id="turn-cue-head" markerWidth="8" markerHeight="8" refX="5" refY="3" orient="auto" markerUnits="strokeWidth">
+          <path d="M0,0 L0,6 L6,3 z" fill="context-stroke"></path>
+        </marker>
+      </defs>
+      <path id="turn-cue-path" marker-end="url(#turn-cue-head)"></path>
+    </svg>
+    <span id="turn-cue-label"></span>
+  </div>
+</div>
+<div class="hud" id="standings"></div>
+<div class="hud" id="speed">0 <small>km/h</small></div>
+<div class="hud" id="cp"></div>
+<div class="hud" id="warn">FUORI STRADA</div>
+<div class="hud" id="handbrake">FRENO A MANO</div>
+<div class="hud" id="start-signal" role="status" aria-live="polite" aria-label="Semaforo di partenza">
+  <div id="start-lights" aria-hidden="true">
+    <span class="start-light"></span>
+    <span class="start-light"></span>
+    <span class="start-light"></span>
+    <span class="start-light"></span>
+    <span class="start-light"></span>
+  </div>
+  <div id="start-go">START!</div>
+</div>
+<canvas class="hud" id="minimap" width="240" height="180"></canvas>
+<div id="join">
+  <div class="card">
+    <h1>Rally San Marino</h1>
+    <p id="join-sub">4 giocatori · strade reali OpenStreetMap</p>
+    <div id="player-setup" style="display:none; margin-bottom:12px;">
+      <div id="identity-setup">
+        <input id="player-name" type="text" placeholder="Nome pilota" maxlength="12" autocomplete="off" style="width:100%; box-sizing:border-box; padding:8px; border:1px solid #30363d; border-radius:6px; background:#0d1117; color:#e6edf3; margin-bottom:8px;" />
+        <input id="player-color" type="color" value="#e33b3b" aria-label="Colore vettura" style="width:100%; height:40px; border:1px solid #30363d; border-radius:6px; background:#0d1117; cursor:pointer;" />
+      </div>
+      <select id="route-select" aria-label="Tracciato" disabled>
+        <option>Caricamento tracciati…</option>
+      </select>
+      <small id="route-hint">Il primo giocatore collegato sarà l'host e sceglierà il tracciato.</small>
+    </div>
+    <button id="join-btn">Entra nella lobby</button>
+    <div id="lobby-controls">
+      <div id="lobby-players" aria-label="Giocatori nella lobby"></div>
+      <div id="lobby-actions">
+        <button id="ready-btn">Sono pronto</button>
+        <button id="start-btn" disabled>Avvia gara</button>
+      </div>
+      <small id="lobby-status" role="status" aria-live="polite"></small>
+    </div>
+  </div>
+</div>
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>

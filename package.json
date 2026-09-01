@@ -1,0 +1,38 @@
+{
+  "name": "rally-san-marino",
+  "version": "0.1.0",
+  "description": "Rally racing game in San Marino, 4-player networked multiplayer, roads from OpenStreetMap",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,green \"node server.js --dev\" \"vite\"",
+    "build": "vite build",
+    "start": "node server.js",
+    "fetch-map": "node scripts/fetch-map.js",
+    "fetch-buildings": "node scripts/fetch-buildings.js",
+    "fetch-elevation": "node scripts/fetch-elevation.js",
+    "fetch-elevation:slow": "node scripts/fetch-elevation.js --pause-ms 300000",
+    "fetch-world": "npm run fetch-buildings && npm run fetch-elevation",
+    "check:syntax": "node scripts/check-syntax.js",
+    "test": "npm run test:server && npm run test:elevation && npm run test:world && npm run test:ci && npm run build && npm run test:production",
+    "test:server": "node scripts/test-server.js",
+    "test:production": "node scripts/test-production.js",
+    "test:elevation": "node scripts/test-elevation.js",
+    "test:world": "node scripts/test-world.js",
+    "test:ci": "node scripts/test-ci.js",
+    "validate:world": "node scripts/validate-world.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5",
+    "socket.io-client": "^4.7.5",
+    "three": "^0.166.1"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "vite": "^5.3.1"
+  }
+}

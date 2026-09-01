@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality-gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CI: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Use Node from .nvmrc
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Check JavaScript syntax
+        run: npm run check:syntax
+
+      - name: Run offline test suites and production smoke
+        run: npm test
+        timeout-minutes: 10
+
+      - name: Validate versioned world data
+        run: npm run validate:world
+
+      - name: Rebuild production artifact
+        run: npm run build

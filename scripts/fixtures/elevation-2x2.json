@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "roadsSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "originX": 0,
+  "originZ": 0,
+  "cell": 10,
+  "cols": 2,
+  "rows": 2,
+  "heights": [0, 10, 20, 30]
+}
