@@ -8,7 +8,8 @@ const ROUTE_RAIL_COUNT = 11;
 function validRoutePoints(routePoints) {
   return Array.isArray(routePoints) && routePoints.length >= 2 && routePoints.every((point) =>
     Array.isArray(point) && point.length >= 2 &&
-    Number.isFinite(point[0]) && Number.isFinite(point[1]));
+    Number.isFinite(point[0]) && Number.isFinite(point[1]) &&
+    (point.length < 3 || Number.isFinite(point[2])));
 }
 
 export function routeOverlayKey(routePoints) {
@@ -35,6 +36,10 @@ function sampledPoint(x, z, heightAt, y) {
     y: (Number.isFinite(groundY) ? groundY : 0) + y,
     z
   };
+}
+
+function profiledPoint(x, z, groundY, y) {
+  return { x, y: groundY + y, z };
 }
 
 function interpolatePoint(start, end, t, heightAt, y) {
@@ -89,7 +94,7 @@ function refineSections(start, end, heightAt, y, depth, output, knownMiddle = nu
   output.push(end);
 }
 
-function routeSections(routePoints, halfWidth, heightAt, y) {
+function routeSections(routePoints, halfWidth, heightAt, y, hasProfile) {
   const base = routePoints.map((point, index) => {
     const previous = routePoints[Math.max(0, index - 1)];
     const next = routePoints[Math.min(routePoints.length - 1, index + 1)];
@@ -108,10 +113,15 @@ function routeSections(routePoints, halfWidth, heightAt, y) {
     return {
       rails: Array.from({ length: ROUTE_RAIL_COUNT }, (_, rail) => {
         const offset = halfWidth * (1 - 2 * rail / (ROUTE_RAIL_COUNT - 1));
-        return sampledPoint(point[0] + nx * offset, point[1] + nz * offset, heightAt, y);
+        const x = point[0] + nx * offset;
+        const z = point[1] + nz * offset;
+        return hasProfile
+          ? profiledPoint(x, z, point[2], y)
+          : sampledPoint(x, z, heightAt, y);
       })
     };
   });
+  if (hasProfile) return base;
   const sections = [base[0]];
   for (let index = 0; index < base.length - 1; index++) {
     refineSections(base[index], base[index + 1], heightAt, y, 0, sections);
@@ -163,14 +173,17 @@ export function createRouteOverlayGeometries(routePoints, {
   if (!validRoutePoints(routePoints)) return null;
 
   const safeY = Number.isFinite(y) ? y : 0.25;
+  const hasProfile = routePoints.every((point) => point.length >= 3 && Number.isFinite(point[2]));
   const points = routePoints.map((point) => {
-    const sampled = sampledPoint(point[0], point[1], heightAt, safeY);
+    const sampled = hasProfile
+      ? profiledPoint(point[0], point[1], point[2], safeY)
+      : sampledPoint(point[0], point[1], heightAt, safeY);
     return new THREE.Vector3(sampled.x, sampled.y, sampled.z);
   });
   const safeWidth = Number.isFinite(width) && width > 0 ? width : 1.4;
   const halfWidth = safeWidth / 2;
   const ribbonPositions = [];
-  const sections = routeSections(routePoints, halfWidth, heightAt, safeY);
+  const sections = routeSections(routePoints, halfWidth, heightAt, safeY, hasProfile);
   const vertex = (point) => [point.x, point.y, point.z];
   const appendRibbon = (startA, startB, endA, endB) => ribbonPositions.push(
     ...vertex(startA), ...vertex(startB), ...vertex(endA),
@@ -204,21 +217,28 @@ export function createRouteOverlayGeometries(routePoints, {
     for (let j = 0; j < count; j++) {
       const start = j / count;
       const end = Math.min(1, (j + safeDashRatio) / count);
-      const dashStart = interpolatePoint(
-        { x: a.x, z: a.z },
-        { x: b.x, z: b.z },
-        start,
-        heightAt,
-        safeY
-      );
-      const dashEnd = interpolatePoint(
-        { x: a.x, z: a.z },
-        { x: b.x, z: b.z },
-        end,
-        heightAt,
-        safeY
-      );
-      appendDrapedDash(dashPoints, dashStart, dashEnd, heightAt, safeY);
+      if (hasProfile) {
+        dashPoints.push(
+          new THREE.Vector3().lerpVectors(a, b, start),
+          new THREE.Vector3().lerpVectors(a, b, end)
+        );
+      } else {
+        const dashStart = interpolatePoint(
+          { x: a.x, z: a.z },
+          { x: b.x, z: b.z },
+          start,
+          heightAt,
+          safeY
+        );
+        const dashEnd = interpolatePoint(
+          { x: a.x, z: a.z },
+          { x: b.x, z: b.z },
+          end,
+          heightAt,
+          safeY
+        );
+        appendDrapedDash(dashPoints, dashStart, dashEnd, heightAt, safeY);
+      }
     }
   }
 

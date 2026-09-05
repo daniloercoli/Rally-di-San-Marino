@@ -1,4 +1,5 @@
 import { RoadIndex, projectToSegment } from './geometry.js';
+import { CURATED_ROUTE_PRESETS, STRADONE_FINISH, isSuperstradaRoad } from './route-presets.js';
 
 export const ROUTE_CHECKPOINT_COUNT = 10;
 export const CHECKPOINT_CAPTURE_RADIUS_M = 18;
@@ -49,6 +50,10 @@ class MinHeap {
 
 const KEY_EPS = 0.1;
 
+function nodeKey(x, z) {
+  return Math.round(x / KEY_EPS) + ',' + Math.round(z / KEY_EPS);
+}
+
 export class RoadGraph {
   constructor(roads) {
     this.nodes = [];
@@ -69,7 +74,7 @@ export class RoadGraph {
   }
 
   nodeFor(x, z) {
-    const key = Math.round(x / KEY_EPS) + ',' + Math.round(z / KEY_EPS);
+    const key = nodeKey(x, z);
     let idx = this.byKey.get(key);
     if (idx === undefined) {
       idx = this.nodes.length;
@@ -596,10 +601,14 @@ function routeCandidates(graph, map) {
 function routeFromCandidate(graph, map, candidate, id, options) {
   const startPlace = map.places[candidate.startIndex];
   const endPlace = map.places[candidate.endIndex];
-  const startNode = candidate.startNode;
-  const endNode = candidate.endNode;
-  const nodePath = graph.aStar(startNode, endNode);
+  const nodePath = graph.aStar(candidate.startNode, candidate.endNode);
+  return routeFromNodePath(graph, nodePath, startPlace.name, endPlace.name, id, options);
+}
+
+function routeFromNodePath(graph, nodePath, startName, endName, id, options) {
   if (!nodePath || nodePath.length < 2) return null;
+  const startNode = nodePath[0];
+  const endNode = nodePath[nodePath.length - 1];
   const pts = nodePath.map((nodeId) => {
     const node = graph.nodes[nodeId];
     return [node.x, node.z];
@@ -621,15 +630,61 @@ function routeFromCandidate(graph, map, candidate, id, options) {
       ...(options.directionOptions || {}),
       checkpointSpacing
     }),
-    start: { name: startPlace.name, x: graph.nodes[startNode].x, z: graph.nodes[startNode].z },
-    end: { name: endPlace.name, x: graph.nodes[endNode].x, z: graph.nodes[endNode].z }
+    start: { name: startName, x: graph.nodes[startNode].x, z: graph.nodes[startNode].z },
+    end: { name: endName, x: graph.nodes[endNode].x, z: graph.nodes[endNode].z }
   };
+}
+
+function namedRoadNode(graph, roads, name, target, maxDistance) {
+  let closest = null;
+  let distance = maxDistance;
+  for (const road of roads) {
+    if (road.name !== name) continue;
+    for (const point of road.points) {
+      const d = Math.hypot(point[0] - target.x, point[1] - target.z);
+      if (d < distance) {
+        closest = point;
+        distance = d;
+      }
+    }
+  }
+  return closest ? graph.byKey.get(nodeKey(...closest)) ?? -1 : -1;
+}
+
+function curatedRoute(graph, map, preset, options) {
+  const startPlace = map.places.find((place) => place.name === preset.start);
+  if (!startPlace || typeof map.proj?.toLocal !== 'function') return null;
+  const target = map.proj.toLocal(STRADONE_FINISH.lon, STRADONE_FINISH.lat);
+  const superstrada = preset.corridor === 'superstrada';
+  const roads = superstrada ? map.roads.filter(isSuperstradaRoad) : map.roads;
+  const routingGraph = superstrada ? new RoadGraph(roads) : graph;
+  const startNode = superstrada
+    ? namedRoadNode(routingGraph, roads, 'Via Tre Settembre', startPlace, 250)
+    : routingGraph.nearestNode(startPlace.x, startPlace.z);
+  const endNode = namedRoadNode(routingGraph, roads, STRADONE_FINISH.name, target, 30);
+  const start = routingGraph.nodes[startNode];
+  if (!start || Math.hypot(start.x - startPlace.x, start.z - startPlace.z) > 250 || endNode < 0) {
+    return null;
+  }
+  const nodePath = routingGraph.aStar(startNode, endNode);
+  if (!nodePath) return null;
+  // Reuse the full graph for junction signs, including roads excluded from the fast route.
+  const fullPath = superstrada ? nodePath.map((id) => {
+    const node = routingGraph.nodes[id];
+    return graph.byKey.get(nodeKey(node.x, node.z));
+  }) : nodePath;
+  if (fullPath.some((id) => !Number.isInteger(id))) return null;
+  const route = routeFromNodePath(graph, fullPath, startPlace.name, STRADONE_FINISH.name,
+    preset.id, options);
+  if (!route || route.lengthM < 1000 || (!superstrada && route.lengthM >= 5000)) return null;
+  return { ...route, label: preset.label };
 }
 
 export function createRouteCatalog(graph, map, options = {}) {
   const limit = Number.isInteger(options.maxRoutes)
     ? Math.max(1, Math.min(options.maxRoutes, 32))
-    : 8;
+    : 12;
+  const legacyLimit = Number.isInteger(options.maxRoutes) ? limit : 8;
   const candidates = routeCandidates(graph, map);
   if (candidates.length === 0) {
     throw new Error('Nessuna coppia di luoghi validi nella stessa componente');
@@ -638,10 +693,16 @@ export function createRouteCatalog(graph, map, options = {}) {
   for (const candidate of candidates) {
     const route = routeFromCandidate(graph, map, candidate, `route-${catalog.length + 1}`, options);
     if (route) catalog.push(route);
-    if (catalog.length >= limit) break;
+    if (catalog.length >= legacyLimit) break;
   }
   if (catalog.length === 0) throw new Error('A* non ha trovato percorsi validi tra i luoghi nominati');
-  return catalog;
+  if (limit > 8) {
+    const curated = CURATED_ROUTE_PRESETS
+      .map((preset) => curatedRoute(graph, map, preset, options))
+      .filter(Boolean);
+    catalog.splice(8, 0, ...curated);
+  }
+  return catalog.slice(0, limit);
 }
 
 export function pickRoute(graph, map, options = {}) {

@@ -1,4 +1,4 @@
-import { DRIVETRAIN, PHYSICS, SURFACE } from '../../shared/physics.js';
+import { DRIVETRAIN, PHYSICS, SURFACE, isLooseSurface } from '../../shared/physics.js';
 
 export function selectLocalSnapshot(snapshots, playerId) {
   if (playerId === null || playerId === undefined || typeof snapshots?.get !== 'function') return null;
@@ -26,7 +26,7 @@ export function normalizeDrivetrainSnapshot(snapshot) {
 export function normalizeSurfaceSnapshot(snapshot) {
   const value = snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot) ? snapshot : {};
   const surface = value.surface === SURFACE.ASPHALT || value.surface === SURFACE.SHOULDER ||
-    value.surface === SURFACE.TRACK || value.surface === SURFACE.GRASS
+    isLooseSurface(value.surface) || value.surface === SURFACE.GRASS
     ? value.surface
     : value.onRoad === false ? SURFACE.GRASS : SURFACE.ASPHALT;
   return { surface };
@@ -80,11 +80,12 @@ export function engineTargets(snapshot) {
     : fallbackRpm;
   const rpmRatio = (rpm - DRIVETRAIN.idleRpm) / (DRIVETRAIN.redlineRpm - DRIVETRAIN.idleRpm);
   const { surface } = normalizeSurfaceSnapshot(snapshot);
-  const pitchFactor = surface === SURFACE.TRACK ? 0.93 : surface === SURFACE.GRASS ? 0.84 : 1;
+  const looseSurface = isLooseSurface(surface);
+  const pitchFactor = looseSurface ? 0.93 : surface === SURFACE.GRASS ? 0.84 : 1;
   const frequency = clamp((55 + rpmRatio * 225) * pitchFactor, 46, 280);
   const gain = surface === SURFACE.ASPHALT || surface === SURFACE.SHOULDER
     ? 0.1 + rpmRatio * 0.28
-    : surface === SURFACE.TRACK ? 0.085 + rpmRatio * 0.22 : 0.065 + rpmRatio * 0.15;
+    : looseSurface ? 0.085 + rpmRatio * 0.22 : 0.065 + rpmRatio * 0.15;
   const brakeLevel = typeof snapshot.brakeLevel === 'number' && Number.isFinite(snapshot.brakeLevel)
     ? clamp(snapshot.brakeLevel, 0, 1)
     : 0;
@@ -92,23 +93,23 @@ export function engineTargets(snapshot) {
   const brakeGain = brakeLevel * brakeSpeed * (
     surface === SURFACE.ASPHALT || surface === SURFACE.SHOULDER
       ? 0.2
-      : surface === SURFACE.TRACK ? 0.14 : 0.09
+      : looseSurface ? 0.14 : 0.09
   );
   const brakeFrequency = clamp(900 + speed * 45, 900, 2200);
   const surfaceSpeed = clamp((speed - 0.5) / 12, 0, 1);
   const surfaceGain = surface === SURFACE.SHOULDER
     ? surfaceSpeed * (0.035 + rpmRatio * 0.025)
-    : surface === SURFACE.TRACK
+    : looseSurface
       ? surfaceSpeed * (0.08 + rpmRatio * 0.08)
       : surface === SURFACE.GRASS ? surfaceSpeed * (0.06 + rpmRatio * 0.05) : 0;
   const surfaceFrequency = surface === SURFACE.SHOULDER
     ? clamp(420 + speed * 9, 420, 950)
-    : surface === SURFACE.TRACK
+    : looseSurface
       ? clamp(180 + speed * 8, 180, 460)
       : surface === SURFACE.GRASS ? clamp(85 + speed * 4, 85, 180) : 120;
   const surfaceQ = surface === SURFACE.SHOULDER
     ? 1.15
-    : surface === SURFACE.TRACK ? 0.9 : surface === SURFACE.GRASS ? 0.45 : 0.7;
+    : looseSurface ? 0.9 : surface === SURFACE.GRASS ? 0.45 : 0.7;
   return {
     frequency,
     gain,

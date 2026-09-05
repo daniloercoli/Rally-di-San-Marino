@@ -55,7 +55,8 @@ fidata: non esporre direttamente il gioco su Internet.
 
 - Premere **Entra nella lobby**, scegliere nome e colore e premere di nuovo lo stesso
   pulsante per entrare.
-- Il primo giocatore è l'host e può scegliere il percorso.
+- Il primo giocatore è l'host e può scegliere fra dodici percorsi, inclusi tre sprint
+  sotto 5 km con arrivo a Piazzale Lo Stradone e Dogana–Città via Superstrada (10,8 km).
 - Tutti premono **Sono pronto**; poi l'host avvia la gara.
 - Usare `WASD` o le frecce per guidare e la barra spaziatrice per il freno a mano.
 

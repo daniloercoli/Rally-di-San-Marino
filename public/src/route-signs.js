@@ -60,7 +60,7 @@ export function createRouteSignGroup(THREE, directions, heightAt = () => 0) {
     const sign = new THREE.Group();
     sign.name = 'route-sign-' + direction.turn;
     sign.userData.routeDirection = direction;
-    const groundY = heightAt(direction.x, direction.z);
+    const groundY = heightAt(direction.x, direction.z, direction.yaw);
     sign.position.set(direction.x, Number.isFinite(groundY) ? groundY : 0, direction.z);
     sign.rotation.y = -direction.yaw;
     sign.visible = false;

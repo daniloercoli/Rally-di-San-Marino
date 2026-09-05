@@ -5,7 +5,7 @@ const validatedTerrains = new WeakSet();
 
 export const CAR_SURFACE_CLEARANCE = 0.1;
 export const CAMERA_SURFACE_CLEARANCE = 2.5;
-export const RENDER_ELEVATION_SCALE = 1.2;
+export const RENDER_ELEVATION_SCALE = 1;
 
 export class WorldDataError extends Error {
   constructor(message) {
@@ -95,10 +95,9 @@ export function terrainMeshHeightAt(terrain, x, z) {
   if (terrain == null) return 0;
   const { tx, tz, h00, h10, h01, h11 } = terrainCellAt(terrain, x, z);
   if (tx + tz <= 1) {
-    return (h00 + tx * (h10 - h00) + tz * (h01 - h00)) * RENDER_ELEVATION_SCALE;
+    return h00 + tx * (h10 - h00) + tz * (h01 - h00);
   }
-  return (h11 + (1 - tx) * (h01 - h11) + (1 - tz) * (h10 - h11)) *
-    RENDER_ELEVATION_SCALE;
+  return h11 + (1 - tx) * (h01 - h11) + (1 - tz) * (h10 - h11);
 }
 
 export function surfaceHeightWithClearance(terrain, x, z, clearance = 0, fallbackHeight = 0) {
@@ -135,8 +134,7 @@ export function createTerrainPositions(terrain, verticalOffset = 0) {
   for (let row = 0; row < terrain.rows; row++) {
     for (let col = 0; col < terrain.cols; col++) {
       const x = terrain.originX + col * terrain.cell;
-      const y = terrain.heights[row * terrain.cols + col] * RENDER_ELEVATION_SCALE +
-        verticalOffset;
+      const y = terrain.heights[row * terrain.cols + col] + verticalOffset;
       const z = terrain.originZ + row * terrain.cell;
       if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
         fail('elevation.json: terrain vertex positions must be finite');
@@ -155,7 +153,7 @@ export function terrainBackdropHeight(terrain, margin = 6) {
   ensureTerrainValidated(terrain);
   let minimum = Infinity;
   for (const height of terrain.heights) minimum = Math.min(minimum, height);
-  return minimum * RENDER_ELEVATION_SCALE - safeMargin;
+  return minimum - safeMargin;
 }
 
 export async function readJsonResponse(response, label, { optional404 = false } = {}) {

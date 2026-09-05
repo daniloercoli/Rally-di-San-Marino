@@ -43,6 +43,12 @@ import {
   rankRaceCars,
   startRace
 } from './shared/race.js';
+import {
+  DEFAULT_WEATHER_ID,
+  WEATHER_PRESETS,
+  normalizeWeatherId,
+  publicWeatherOptions
+} from './shared/weather.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const COLORS = ['#e33b3b', '#3b6fe2', '#e2c23b', '#3be26f'];
@@ -172,12 +178,14 @@ export function startServer({
   const seatOwner = [null, null, null, null];
   let nextJoinOrder = 1;
   let hostPlayerId = null;
+  let weatherId = DEFAULT_WEATHER_ID;
   let raceState = createRaceState((fixedStartDelayMs ?? START_DELAY_MAX_MS) / 1000, Date.now());
   let sessionBestMs = null;
 
   function publicRouteOptions() {
     return routeCatalog.map((candidate) => ({
       id: candidate.id,
+      label: candidate.label || '',
       start: candidate.start.name,
       end: candidate.end.name,
       lengthKm: +(candidate.lengthM / 1000).toFixed(1),
@@ -189,6 +197,8 @@ export function startServer({
     return {
       routeOptions: publicRouteOptions(),
       selectedRouteId: route.id,
+      weatherOptions: publicWeatherOptions(),
+      selectedWeatherId: weatherId,
       locked: raceState.phase !== RACE_PHASE.WAITING,
       phase: raceState.phase,
       capacity: seatOwner.length,
@@ -211,6 +221,10 @@ export function startServer({
     const nextRoute = selected || routeCatalog[0];
     if (nextRoute.id !== route.id) sessionBestMs = null;
     applyRoute(nextRoute);
+  }
+
+  function selectHostWeather(value) {
+    weatherId = normalizeWeatherId(value);
   }
 
   const app = express();
@@ -334,6 +348,7 @@ export function startServer({
       round: racePublic.round,
       totalCp: cps.length,
       bestMs: sessionBestMs,
+      weatherId,
       cars: publicCars(nowMs, racePublic)
     };
   }
@@ -348,6 +363,7 @@ export function startServer({
       routePath: route.path.flat(),
       routeDirections: route.directions,
       routeId: route.id,
+      weatherId,
       host: id === hostPlayerId,
       start: route.start,
       end: route.end,
@@ -383,7 +399,10 @@ export function startServer({
         return;
       }
       const data = normalizePayload(rawData);
-      if (cars.size === 0) selectHostRoute(data.routeId);
+      if (cars.size === 0) {
+        selectHostRoute(data.routeId);
+        selectHostWeather(data.weatherId);
+      }
       seatOwner[seat] = socket.id;
       const id = seat + 1;
       const name = (typeof data.name === 'string' && data.name.trim()) ? data.name.trim().slice(0, 12) : 'P' + id;
@@ -427,6 +446,19 @@ export function startServer({
         const car = cars.get(seat + 1);
         if (playerSocket && car) playerSocket.emit('init', buildInit(seat + 1, car, nowMs));
       }
+      io.emit('lobby', buildLobby());
+    });
+
+    socket.on('lobby:weather', (rawData) => {
+      const id = socket.data.playerId;
+      if (id !== hostPlayerId || raceState.phase !== RACE_PHASE.WAITING) return;
+      const data = normalizePayload(rawData);
+      const selected = typeof data.weatherId === 'string'
+        ? WEATHER_PRESETS.find((candidate) => candidate.id === data.weatherId)
+        : null;
+      if (!selected || selected.id === weatherId) return;
+      weatherId = selected.id;
+      resetReadyPlayers();
       io.emit('lobby', buildLobby());
     });
 
@@ -685,6 +717,7 @@ export function startServer({
     inputs,
     readyById,
     getHostPlayerId: () => hostPlayerId,
+    getWeatherId: () => weatherId,
     getRaceState: () => raceState,
     close() {
       clearInterval(timer);

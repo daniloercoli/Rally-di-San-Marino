@@ -50,8 +50,9 @@
   #join button { pointer-events: auto; font-size: 18px; padding: 10px 26px; border-radius: 8px; border: 1px solid #30363d; background: #21262d; color: #e6edf3; cursor: pointer; }
   #join button:hover { background: #30363d; }
   #join button:disabled { opacity: .5; cursor: default; }
-  #route-select { width: 100%; padding: 8px; border: 1px solid #30363d; border-radius: 6px; background: #0d1117; color: #e6edf3; margin-top: 8px; }
-  #route-hint { display: block; max-width: 360px; margin-top: 5px; color: #8b949e; font-size: 12px; text-align: left; }
+  .setup-label { display: block; margin-top: 10px; color: #c9d1d9; font-size: 13px; font-weight: 600; text-align: left; }
+  #route-select, #weather-select { width: 100%; padding: 8px; border: 1px solid #30363d; border-radius: 6px; background: #0d1117; color: #e6edf3; margin-top: 5px; }
+  #route-hint, #weather-hint { display: block; max-width: 360px; margin-top: 5px; color: #8b949e; font-size: 12px; text-align: left; }
   #lobby-controls { display: none; margin-top: 16px; }
   #lobby-players { display: grid; gap: 6px; margin: 12px 0; text-align: left; }
   #lobby-players .player { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 10px; border: 1px solid #30363d; border-radius: 7px; background: #161b22; }
@@ -105,10 +106,16 @@
         <input id="player-name" type="text" placeholder="Nome pilota" maxlength="12" autocomplete="off" style="width:100%; box-sizing:border-box; padding:8px; border:1px solid #30363d; border-radius:6px; background:#0d1117; color:#e6edf3; margin-bottom:8px;" />
         <input id="player-color" type="color" value="#e33b3b" aria-label="Colore vettura" style="width:100%; height:40px; border:1px solid #30363d; border-radius:6px; background:#0d1117; cursor:pointer;" />
       </div>
-      <select id="route-select" aria-label="Tracciato" disabled>
+      <label class="setup-label" for="route-select">Tracciato</label>
+      <select id="route-select" disabled>
         <option>Caricamento tracciati…</option>
       </select>
       <small id="route-hint">Il primo giocatore collegato sarà l'host e sceglierà il tracciato.</small>
+      <label class="setup-label" for="weather-select">Meteo</label>
+      <select id="weather-select" disabled>
+        <option>Caricamento meteo…</option>
+      </select>
+      <small id="weather-hint">Sereno è il meteo predefinito.</small>
     </div>
     <button id="join-btn">Entra nella lobby</button>
     <div id="lobby-controls">

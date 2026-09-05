@@ -16,6 +16,7 @@ import {
   parseOsmLanes,
   parseOsmWidth,
   roadColorFromTags,
+  roadDriveSurface,
   roadIsUnpaved,
   roadWidthFromTags
 } from '../shared/mapdata.js';
@@ -36,8 +37,10 @@ import {
   collide,
   createCar,
   directionLockForTick,
+  forwardSpeedResponse,
   forwardX,
   forwardZ,
+  looseSurfaceMotion,
   rpmForSpeed,
   simulationSubsteps,
   stepCar
@@ -58,6 +61,7 @@ import {
   resample,
   resampleByCount
 } from '../shared/route.js';
+import { STRADONE_FINISH, SUPERSTRADA_ROAD_NAMES, isSuperstradaRoad } from '../shared/route-presets.js';
 import {
   RESULTS_DURATION_MS,
   RACE_PHASE,
@@ -76,6 +80,12 @@ import {
   rankRaceCars,
   startRace
 } from '../shared/race.js';
+import {
+  DEFAULT_WEATHER_ID,
+  WEATHER_PRESETS,
+  normalizeWeatherId,
+  publicWeatherOptions
+} from '../shared/weather.js';
 import {
   createRouteOverlayGeometries,
   routeOverlayKey,
@@ -113,6 +123,7 @@ import { INITIAL_JOIN_STATE, JOIN_PHASE, joinView, transitionJoin } from '../pub
 import { readDrivingInput, shouldPreventDrivingKey } from '../public/src/input-state.js';
 import { disposeObject3D } from '../public/src/scene-resources.js';
 import { startSignalAudioEvent, startSignalView } from '../public/src/start-lights.js';
+import { weatherViewForWorld } from '../public/src/weather-view.js';
 import {
   advanceStreetBanner,
   createStreetBannerState,
@@ -199,16 +210,86 @@ try {
     surfaceIndex.query(30, 0).surface === SURFACE.TRACK &&
     surfaceIndex.query(100, 0).surface === SURFACE.GRASS,
   'RoadIndex classifies asphalt, paved shoulder, OSM track and grass with one authoritative value');
+  const materialFixture = parseMapData({ elements: [
+    ['track', 'gravel'],
+    ['track', 'mud'],
+    ['track', 'asphalt'],
+    ['residential', 'gravel'],
+    ['unclassified', 'ground'],
+    ['track', null]
+  ].map(([highway, surface], fixtureIndex) => ({
+    type: 'way',
+    tags: { highway, ...(surface ? { surface } : {}) },
+    geometry: [
+      { lon: 12.4, lat: 43.9 + fixtureIndex * 0.001 },
+      { lon: 12.401, lat: 43.9 + fixtureIndex * 0.001 }
+    ]
+  })) });
+  const materialIndex = new RoadIndex(materialFixture.roads);
+  const materialSurfaces = materialFixture.roads.map((fixtureRoad) => {
+    const midpoint = fixtureRoad.points[Math.floor(fixtureRoad.points.length / 2)];
+    return materialIndex.query(midpoint[0], midpoint[1]).surface;
+  });
+  ok(JSON.stringify(materialSurfaces) === JSON.stringify([
+    SURFACE.GRAVEL,
+    SURFACE.MUD,
+    SURFACE.ASPHALT,
+    SURFACE.GRAVEL,
+    SURFACE.TRACK,
+    SURFACE.TRACK
+  ]),
+  'RoadIndex distinguishes gravel, mud, paved tracks and unpaved non-track roads');
+  const structuredRoads = parseMapData({ elements: [
+    {
+      type: 'way',
+      id: 991,
+      nodes: [4401, 4402, 4403],
+      tags: { highway: 'primary', bridge: 'yes', layer: '1' },
+      geometry: [
+        { lon: 12.4, lat: 43.9 },
+        { lon: 12.400005, lat: 43.9 },
+        { lon: 12.401, lat: 43.9 }
+      ]
+    },
+    {
+      type: 'way',
+      id: 992,
+      nodes: [4402, 4404],
+      tags: { highway: 'residential', tunnel: 'yes', layer: 'invalid' },
+      geometry: [
+        { lon: 12.400005, lat: 43.9 },
+        { lon: 12.400005, lat: 43.901 }
+      ]
+    }
+  ] }).roads;
+  const structuredRoad = structuredRoads[0];
+  const tunnelRoad = structuredRoads[1];
+  ok(structuredRoad.osmId === 991 &&
+    JSON.stringify(structuredRoad.nodeIds) === JSON.stringify([4401, 4403]) &&
+    JSON.stringify(structuredRoad.profileNodeIds) === JSON.stringify([4401, 4402, 4403]) &&
+    structuredRoad.layer === 1 && structuredRoad.bridge && !structuredRoad.tunnel &&
+    tunnelRoad.layer === -1 && tunnelRoad.tunnel && !tunnelRoad.bridge,
+  'map parser preserves close shared OSM nodes and bounded structure metadata through decimation');
   const namedRoads = map.roads.filter((candidate) => candidate.name);
   ok(namedRoads.length === 1721 && new Set(namedRoads.map((candidate) => candidate.name)).size === 718,
     'real map preserves 1,721 named roads with 718 distinct OSM names');
+  const driveSurfaceCounts = map.roads.reduce((counts, candidate) => {
+    counts[candidate.driveSurface] = (counts[candidate.driveSurface] || 0) + 1;
+    return counts;
+  }, {});
+  ok(driveSurfaceCounts[SURFACE.ASPHALT] === 1921 &&
+    driveSurfaceCounts[SURFACE.TRACK] === 464 &&
+    driveSurfaceCounts[SURFACE.GRAVEL] === 22 &&
+    driveSurfaceCounts[SURFACE.MUD] === 4,
+  'real map classifies paved, generic dirt, gravel and mud roads deterministically');
 
   const synth = new RoadIndex([{ cls: 'primary', width: 10, isTrack: false, points: [[0, -5000], [0, 5000]] }]);
   const car = createCar(1, 0, 0, 0, '#fff', 'T');
   ok(car.gear === 1 && car.rpm === DRIVETRAIN.idleRpm && car.brakeLevel === 0 && !car.handbrake &&
     car.surface === SURFACE.ASPHALT &&
+    Number.isFinite(car.surfaceDriftPhase) &&
     car.impactSeq === 0 && car.impactLevel === 0,
-  'new car starts on asphalt in first gear at idle with no braking, handbrake or fabricated impact');
+  'new car starts on asphalt with finite drivetrain and loose-surface phase state');
   ok(automaticGear(20.1, 1, 1) === 2 && automaticGear(19.8, 2, 1) === 2,
     'automatic gearbox upshifts and keeps hysteresis near the threshold');
   ok(automaticGear(10.9, 2, 0) === 1, 'automatic gearbox downshifts below its hysteresis band');
@@ -219,36 +300,47 @@ try {
   let sawCleanUpshift = false;
   const visitedGears = new Set([car.gear]);
   let reached100At = null;
+  let reached180At = null;
+  let reached195At = null;
+  let reached199At = null;
   let reached200At = null;
-  let reached240At = null;
-  let reached249At = null;
-  let reached250At = null;
   for (let i = 0; i < 1200; i++) {
     stepCar(car, { u: 1, a: 0 }, synth, 0.05);
     if (car.gear > previousGear && car.rpm < previousRpm) sawCleanUpshift = true;
     visitedGears.add(car.gear);
     if (reached100At === null && car.speed * 3.6 >= 100) reached100At = (i + 1) * 0.05;
+    if (reached180At === null && car.speed * 3.6 >= 180) reached180At = (i + 1) * 0.05;
+    if (reached195At === null && car.speed * 3.6 >= 195) reached195At = (i + 1) * 0.05;
+    if (reached199At === null && car.speed * 3.6 >= 199) reached199At = (i + 1) * 0.05;
     if (reached200At === null && car.speed * 3.6 >= 200) reached200At = (i + 1) * 0.05;
-    if (reached240At === null && car.speed * 3.6 >= 240) reached240At = (i + 1) * 0.05;
-    if (reached249At === null && car.speed * 3.6 >= 249) reached249At = (i + 1) * 0.05;
-    if (reached250At === null && car.speed * 3.6 >= 250 - 1e-6) reached250At = (i + 1) * 0.05;
     previousGear = car.gear;
     previousRpm = car.rpm;
   }
-  ok(Math.abs(PHYSICS.onRoad.maxSpeed * 3.6 - 250) < 1e-9 &&
+  ok(Math.abs(PHYSICS.onRoad.maxSpeed * 3.6 - 200) < 1e-9 &&
+    PHYSICS.shoulder.maxSpeed === PHYSICS.onRoad.maxSpeed &&
     Math.abs(car.speed - PHYSICS.onRoad.maxSpeed) < 0.05,
-  'accelerates to the 250 km/h road limit without exceeding it (speed=' +
+  'accelerates to the 200 km/h paved limit without exceeding it (speed=' +
     (car.speed * 3.6).toFixed(1) + ' km/h)');
-  ok(reached100At >= 2.2 && reached100At <= 2.6 && reached200At >= 6.5 && reached200At <= 7.6,
-    'moderate arcade acceleration reaches 100/200 km/h in the target windows (' +
-      reached100At + 's/' + reached200At + 's)');
-  ok(reached240At >= 13 && reached240At <= 22 && reached249At >= 22 && reached249At <= 40 &&
-    reached249At - reached200At >= 15 && reached249At - reached240At >= 7,
-  'high-speed taper makes 200-249 km/h substantially slower (' +
-    reached200At + 's/' + reached240At + 's/' + reached249At + 's)');
-  ok(reached250At !== null && reached250At > reached249At && reached250At <= 55,
-    'the final kilometre per hour remains reachable only after the long acceleration tail (' +
-      reached250At + 's)');
+  ok(reached100At >= 2.4 && reached100At <= 2.7 &&
+    reached180At >= 7.5 && reached180At <= 8.3,
+  'paved acceleration preserves 0-100 but lengthens the run to 180 km/h (' +
+    reached100At + 's/' + reached180At + 's)');
+  ok(reached195At >= 11.7 && reached195At <= 13.2 &&
+    reached199At >= 13.5 && reached199At <= 15.3 &&
+    reached200At >= 14.3 && reached200At <= 16 &&
+    reached195At - reached180At >= 3.5 && reached200At - reached195At >= 2.2,
+  'the final paved acceleration approaches 200 km/h progressively (' +
+    reached180At + 's/' + reached195At + 's/' + reached199At + 's/' + reached200At + 's)');
+  const pavedResponseAt100 = forwardSpeedResponse(100 / 3.6, PHYSICS.onRoad.maxSpeed, true);
+  const pavedResponseAt180 = forwardSpeedResponse(180 / 3.6, PHYSICS.onRoad.maxSpeed, true);
+  const unchangedTrackResponse = forwardSpeedResponse(50 / 3.6, PHYSICS.track.maxSpeed, false);
+  ok(Math.abs(pavedResponseAt100 - (1 - Math.pow(100 / 215, 2))) < 1e-12 &&
+    pavedResponseAt180 < pavedResponseAt100 * 0.2 &&
+    Math.abs(unchangedTrackResponse - (1 - Math.pow(50 / 110, 2))) < 1e-12,
+  'the added non-linear taper starts after 100 km/h and leaves non-paved response unchanged');
+  for (let i = 0; i < 20; i++) stepCar(car, { u: 1, a: 0 }, synth, 0.05);
+  ok(Number.isFinite(car.speed) && car.speed === PHYSICS.onRoad.maxSpeed,
+    'holding full throttle at the 200 km/h limiter remains finite and stable');
   ok(sawCleanUpshift && visitedGears.size === 5 && car.gear === 5,
     'acceleration uses all five gears with clean automatic upshifts');
   ok(Number.isFinite(car.rpm) && car.rpm >= DRIVETRAIN.idleRpm && car.rpm <= DRIVETRAIN.redlineRpm,
@@ -262,10 +354,10 @@ try {
     }
     return Infinity;
   }
-  const time249At50Ms = timeToRoadSpeed(249, 0.05);
-  ok(Math.abs(timeToRoadSpeed(249, 0.025) - time249At50Ms) <= 0.2 &&
-    Math.abs(timeToRoadSpeed(249, 0.1) - time249At50Ms) <= 0.2,
-  'high-speed acceleration tail remains stable across simulation step sizes');
+  const time199At50Ms = timeToRoadSpeed(199, 0.05);
+  ok(Math.abs(timeToRoadSpeed(199, 0.025) - time199At50Ms) <= 0.25 &&
+    Math.abs(timeToRoadSpeed(199, 0.1) - time199At50Ms) <= 0.25,
+  'acceleration near the paved limiter remains stable across simulation step sizes');
   const offcar = createCar(2, 500, 0, 0, '#fff', 'T');
   for (let i = 0; i < 300; i++) stepCar(offcar, { u: 1, a: 0 }, synth, 0.05);
   ok(!offcar.onRoad, 'off-road detected');
@@ -279,6 +371,177 @@ try {
     Math.abs(trackCar.speed - PHYSICS.track.maxSpeed) < 0.05 && trackCar.surface === SURFACE.TRACK,
   'dirt track converges to its lower 110 km/h limit (speed=' +
     (trackCar.speed * 3.6).toFixed(1) + ' km/h)');
+
+  function looseRoadIndex(surface, width = 20) {
+    return new RoadIndex([{
+      cls: 'track',
+      width,
+      isTrack: true,
+      driveSurface: surface,
+      points: [[0, -5000], [0, 5000]]
+    }]);
+  }
+
+  function looseAcceleration(surface, dt = 0.05) {
+    const profile = PHYSICS[surface];
+    const sample = createCar(60, 0, 0, 0, '#fff', surface + ' acceleration');
+    sample.surface = surface;
+    const driveIndex = looseRoadIndex(surface);
+    let reached60At = null;
+    let reachedLimitAt = null;
+    for (let elapsed = 0; elapsed < 30 - 1e-9; elapsed += dt) {
+      stepCar(sample, { u: 1, a: 0 }, driveIndex, dt);
+      if (reached60At === null && sample.speed * 3.6 >= 60) reached60At = elapsed + dt;
+      if (reachedLimitAt === null && sample.speed >= profile.maxSpeed) reachedLimitAt = elapsed + dt;
+    }
+    return { reached60At, reachedLimitAt, speed: sample.speed };
+  }
+
+  const dirtAcceleration = looseAcceleration(SURFACE.TRACK);
+  const gravelAcceleration = looseAcceleration(SURFACE.GRAVEL);
+  const mudAcceleration = looseAcceleration(SURFACE.MUD);
+  ok(Math.abs(PHYSICS.gravel.maxSpeed * 3.6 - 95) < 1e-9 &&
+    Math.abs(PHYSICS.mud.maxSpeed * 3.6 - 65) < 1e-9 &&
+    Math.abs(gravelAcceleration.speed - PHYSICS.gravel.maxSpeed) < 0.05 &&
+    Math.abs(mudAcceleration.speed - PHYSICS.mud.maxSpeed) < 0.05,
+  'gravel and mud converge to their 95 and 65 km/h limits without affecting generic dirt');
+  ok(dirtAcceleration.reached60At >= 2.6 && dirtAcceleration.reached60At <= 2.9 &&
+    gravelAcceleration.reached60At >= 3.1 && gravelAcceleration.reached60At <= 3.5 &&
+    mudAcceleration.reached60At >= 6.3 && mudAcceleration.reached60At <= 6.8 &&
+    dirtAcceleration.reached60At < gravelAcceleration.reached60At &&
+    gravelAcceleration.reached60At < mudAcceleration.reached60At,
+  'loose-surface acceleration weakens progressively from dirt to gravel and mud');
+
+  function looseBrakingDistance(surface) {
+    const sample = createCar(61, 0, 0, 0, '#fff', surface + ' braking');
+    sample.surface = surface;
+    sample.speed = 60 / 3.6;
+    const driveIndex = looseRoadIndex(surface);
+    const startZ = sample.z;
+    for (let elapsed = 0; sample.speed > 0 && elapsed < 10; elapsed += 0.05) {
+      stepCar(sample, { u: -1, a: 0 }, driveIndex, 0.05);
+    }
+    return Math.abs(sample.z - startZ);
+  }
+
+  const dirtBrakingDistance = looseBrakingDistance(SURFACE.TRACK);
+  const gravelBrakingDistance = looseBrakingDistance(SURFACE.GRAVEL);
+  const mudBrakingDistance = looseBrakingDistance(SURFACE.MUD);
+  ok(dirtBrakingDistance >= 6.7 && dirtBrakingDistance <= 7.1 &&
+    gravelBrakingDistance >= 8.6 && gravelBrakingDistance <= 9.1 &&
+    mudBrakingDistance >= 12 && mudBrakingDistance <= 12.5 &&
+    dirtBrakingDistance < gravelBrakingDistance && gravelBrakingDistance < mudBrakingDistance,
+  'braking distance grows progressively on gravel and mud');
+
+  function looseSteerResponse(surface) {
+    const sample = createCar(62, 0, 0, 0, '#fff', surface + ' steering');
+    sample.surface = surface;
+    sample.speed = 60 / 3.6;
+    stepCar(sample, { u: 0, a: 1 }, looseRoadIndex(surface), 0.05);
+    return sample.yaw;
+  }
+
+  const dirtSteer = looseSteerResponse(SURFACE.TRACK);
+  const gravelSteer = looseSteerResponse(SURFACE.GRAVEL);
+  const mudSteer = looseSteerResponse(SURFACE.MUD);
+  ok(dirtSteer > gravelSteer && gravelSteer > mudSteer && mudSteer > 0,
+    'steering response weakens progressively from dirt to gravel and mud at the same speed');
+
+  function straightLooseMotion(surface, dt = 0.05, duration = 30, id = 70) {
+    const sample = createCar(id, 0, 0, 0, '#fff', surface + ' straight motion');
+    sample.surface = surface;
+    sample.speed = 60 / 3.6;
+    const driveIndex = looseRoadIndex(surface, ROAD_CLASSES.track.width);
+    let previousX = sample.x;
+    let movedLeft = false;
+    let movedRight = false;
+    let minX = sample.x;
+    let maxX = sample.x;
+    for (let elapsed = 0; elapsed < duration - 1e-9; elapsed += dt) {
+      stepCar(sample, { u: 1, a: 0 }, driveIndex, dt);
+      const lateralDelta = sample.x - previousX;
+      if (lateralDelta < -1e-5) movedLeft = true;
+      if (lateralDelta > 1e-5) movedRight = true;
+      minX = Math.min(minX, sample.x);
+      maxX = Math.max(maxX, sample.x);
+      previousX = sample.x;
+    }
+    return { sample, movedLeft, movedRight, minX, maxX, span: maxX - minX };
+  }
+
+  const looseStraightRuns = [SURFACE.TRACK, SURFACE.GRAVEL, SURFACE.MUD]
+    .map((surface) => straightLooseMotion(surface));
+  ok(looseStraightRuns.every(({ movedLeft, movedRight, span, minX, maxX, sample }) =>
+    movedLeft && movedRight && span >= 0.08 && span < 0.8 &&
+    Math.max(Math.abs(minX), Math.abs(maxX)) < 0.9 &&
+    Math.max(Math.abs(minX), Math.abs(maxX)) + CAR_RADIUS < ROAD_CLASSES.track.width / 2 &&
+    sample.onRoad) &&
+    looseStraightRuns[0].span < looseStraightRuns[1].span &&
+    looseStraightRuns[1].span < looseStraightRuns[2].span,
+  'loose surfaces create bounded left/right movement instead of a perfectly railed trajectory');
+  const repeatedGravelRun = straightLooseMotion(SURFACE.GRAVEL);
+  ok(repeatedGravelRun.sample.x === looseStraightRuns[1].sample.x &&
+    repeatedGravelRun.sample.z === looseStraightRuns[1].sample.z &&
+    repeatedGravelRun.sample.yaw === looseStraightRuns[1].sample.yaw &&
+    repeatedGravelRun.sample.surfaceDriftPhase === looseStraightRuns[1].sample.surfaceDriftPhase,
+  'the same car and inputs reproduce the exact same loose-surface trajectory');
+  const gravelDtRuns = [0.025, 0.05, 0.1]
+    .map((dt) => straightLooseMotion(SURFACE.GRAVEL, dt));
+  const gravelXs = gravelDtRuns.map(({ sample }) => sample.x);
+  const gravelYaws = gravelDtRuns.map(({ sample }) => sample.yaw);
+  ok(Math.max(...gravelXs) - Math.min(...gravelXs) < 0.2 &&
+    (Math.max(...gravelYaws) - Math.min(...gravelYaws)) * 180 / Math.PI < 0.3,
+  'loose-surface trajectory remains stable at 25, 50 and 100 ms');
+
+  const motionPeaks = [SURFACE.TRACK, SURFACE.GRAVEL, SURFACE.MUD].map((surface) => {
+    let lateralSpeed = 0;
+    let yawRate = 0;
+    for (let index = 0; index < 360; index++) {
+      const motion = looseSurfaceMotion(surface, 60 / 3.6, index * Math.PI / 180);
+      lateralSpeed = Math.max(lateralSpeed, Math.abs(motion.lateralSpeed));
+      yawRate = Math.max(yawRate, Math.abs(motion.yawRate));
+    }
+    return { lateralSpeed, yawRate };
+  });
+  ok(motionPeaks[0].lateralSpeed < motionPeaks[1].lateralSpeed &&
+    motionPeaks[1].lateralSpeed < motionPeaks[2].lateralSpeed &&
+    motionPeaks.every(({ yawRate }, index) =>
+      yawRate < PHYSICS[[SURFACE.TRACK, SURFACE.GRAVEL, SURFACE.MUD][index]].steer * 0.02),
+  'surface disturbance grows across loose materials but stays well below driver steering authority');
+
+  function excludedSurfaceMotion(surface, x, roadIndex) {
+    const sample = createCar(71, x, 0, 0, '#fff', surface + ' no drift');
+    sample.surface = surface;
+    sample.onRoad = surface !== SURFACE.GRASS;
+    sample.speed = 60 / 3.6;
+    const initialPhase = sample.surfaceDriftPhase;
+    for (let elapsed = 0; elapsed < 10 - 1e-9; elapsed += 0.05) {
+      stepCar(sample, { u: 1, a: 0 }, roadIndex, 0.05);
+    }
+    return { sample, initialPhase };
+  }
+
+  const excludedRuns = [
+    excludedSurfaceMotion(SURFACE.ASPHALT, 0, synth),
+    excludedSurfaceMotion(SURFACE.SHOULDER, 6.2, synth),
+    excludedSurfaceMotion(SURFACE.GRASS, 500, synth)
+  ];
+  ok(excludedRuns.every(({ sample, initialPhase }, index) =>
+    sample.x === [0, 6.2, 500][index] && sample.yaw === 0 &&
+    sample.surfaceDriftPhase === initialPhase),
+  'asphalt, shoulder and grass remain perfectly straight and do not advance the drift phase');
+  const stoppedLooseMotion = looseSurfaceMotion(SURFACE.GRAVEL, 2, 1);
+  const invalidLooseMotion = looseSurfaceMotion(SURFACE.MUD, Infinity, NaN);
+  const corruptedPhaseCar = createCar(72, 0, 0, 0, '#fff', 'invalid drift phase');
+  corruptedPhaseCar.surface = SURFACE.GRAVEL;
+  corruptedPhaseCar.surfaceDriftPhase = Infinity;
+  corruptedPhaseCar.speed = 60 / 3.6;
+  stepCar(corruptedPhaseCar, { u: 1, a: 0 }, looseRoadIndex(SURFACE.GRAVEL), 0.05);
+  ok(Object.values(stoppedLooseMotion).every((value) => value === 0) &&
+    Object.values(invalidLooseMotion).every((value) => Number.isFinite(value) && value === 0) &&
+    Number.isFinite(corruptedPhaseCar.surfaceDriftPhase) && Number.isFinite(corruptedPhaseCar.x) &&
+    Number.isFinite(corruptedPhaseCar.z) && Number.isFinite(corruptedPhaseCar.yaw),
+  'low speed and malformed drift inputs cannot create motion or non-finite car state');
 
   const asphaltParityCar = createCar(50, 0, 0, 0, '#fff', 'asphalt parity');
   const shoulderParityCar = createCar(51, 6.2, 0, 0, '#fff', 'shoulder parity');
@@ -335,25 +598,35 @@ try {
   }
   ok(Math.abs(speedAfterOffRoadSecond(0.05) - speedAfterOffRoadSecond(0.1)) < 0.1,
     'progressive off-road slowdown remains stable across simulation dt values');
-  function speedAfterTrackSecond(dt) {
-    const sample = createCar(47, 30, 0, 0, '#fff', 'track dt');
-    sample.surface = SURFACE.TRACK;
+  function speedAfterLooseSecond(surface, dt) {
+    const sample = createCar(47, 0, 0, 0, '#fff', surface + ' dt');
+    sample.surface = surface;
     sample.speed = PHYSICS.onRoad.maxSpeed;
+    const driveIndex = looseRoadIndex(surface);
     for (let elapsed = 0; elapsed < 1 - 1e-9; elapsed += dt) {
-      stepCar(sample, { u: 1, a: 0 }, surfaceIndex, dt);
+      stepCar(sample, { u: 1, a: 0 }, driveIndex, dt);
     }
     return sample.speed;
   }
-  const trackEntry = createCar(48, 30, 0, 0, '#fff', 'track entry');
-  trackEntry.surface = SURFACE.TRACK;
-  trackEntry.speed = PHYSICS.onRoad.maxSpeed;
-  const trackEntrySpeed = trackEntry.speed;
-  stepCar(trackEntry, { u: 1, a: 0 }, surfaceIndex, 0.05);
-  ok(trackEntry.speed < trackEntrySpeed && trackEntrySpeed - trackEntry.speed < 1 &&
-    trackEntry.speed > PHYSICS.track.maxSpeed,
-  'entering dirt applies progressive slowdown instead of an instant speed cap');
-  ok(Math.abs(speedAfterTrackSecond(0.025) - speedAfterTrackSecond(0.1)) < 0.1,
-    'progressive dirt slowdown remains stable across simulation dt values');
+  const looseEntrySurfaces = [SURFACE.TRACK, SURFACE.GRAVEL, SURFACE.MUD];
+  const looseEntries = looseEntrySurfaces.map((surface) => {
+    const sample = createCar(48, 0, 0, 0, '#fff', surface + ' entry');
+    sample.surface = surface;
+    sample.speed = PHYSICS.onRoad.maxSpeed;
+    const entrySpeed = sample.speed;
+    stepCar(sample, { u: 1, a: 0 }, looseRoadIndex(surface), 0.05);
+    return { surface, entrySpeed, speed: sample.speed };
+  });
+  ok(looseEntries.every(({ surface, entrySpeed: before, speed: after }) =>
+    after < before && before - after < 1 && after > PHYSICS[surface].maxSpeed),
+  'entering dirt, gravel or mud applies progressive slowdown instead of an instant cap');
+  ok(looseEntrySurfaces.every((surface) => {
+    const speed25 = speedAfterLooseSecond(surface, 0.025);
+    const speed50 = speedAfterLooseSecond(surface, 0.05);
+    const speed100 = speedAfterLooseSecond(surface, 0.1);
+    return Math.max(speed25, speed50, speed100) - Math.min(speed25, speed50, speed100) < 0.1;
+  }),
+  'progressive loose-surface slowdown remains stable at 25, 50 and 100 ms');
   ok(CAR_RADIUS * 2 < ROAD_CLASSES.track.width,
     'car collision footprint is narrower than the narrowest road class');
 
@@ -472,6 +745,14 @@ try {
     roadColorFromTags({ highway: 'track', surface: 'concrete' }) === ROAD_SURFACE_COLORS.concrete &&
     roadColorFromTags({ highway: 'track', surface: 'unknown' }) === TRACK_SURFACE_FALLBACK_COLOR,
   'surface normalization distinguishes paved, unpaved, common track materials and safe fallbacks');
+  ok(roadDriveSurface({ highway: 'track', surface: 'asphalt' }) === SURFACE.ASPHALT &&
+    roadDriveSurface({ highway: 'residential', surface: 'fine_gravel' }) === SURFACE.GRAVEL &&
+    roadDriveSurface({ highway: 'track', surface: 'pebblestone' }) === SURFACE.GRAVEL &&
+    roadDriveSurface({ highway: 'track', surface: 'clay' }) === SURFACE.MUD &&
+    roadDriveSurface({ highway: 'track', surface: 'mud' }) === SURFACE.MUD &&
+    roadDriveSurface({ highway: 'track', surface: 'ground' }) === SURFACE.TRACK &&
+    roadDriveSurface({ highway: 'track', surface: 'unknown' }) === SURFACE.TRACK,
+  'drive-surface groups normalize OSM materials and use generic dirt as a safe fallback');
   ok(parseOsmWidth('10.5 m') === 10.5 && Math.abs(parseOsmWidth("12'") - 3.6576) < 1e-9 &&
     parseOsmWidth('3;4') === null && parseOsmWidth('40') === null,
   'OSM width parser accepts plausible metric/feet values and rejects ambiguous or unsafe values');
@@ -965,8 +1246,10 @@ try {
     JSON.stringify(routeTargetVisibility(1, 3, false)) === JSON.stringify({ checkpoint: false, finish: true }) &&
     JSON.stringify(routeTargetVisibility(2, 3, true)) === JSON.stringify({ checkpoint: false, finish: false }),
   'the red finish target remains active while intermediate checkpoints are optional');
-  const routeCatalog = createRouteCatalog(graph, map, { maxRoutes: 8 });
-  ok(routeCatalog.length === 8 && routeCatalog[0].id === 'route-1' &&
+  const routeCatalog = createRouteCatalog(graph, map);
+  ok(routeCatalog.length === 12 && routeCatalog.filter((candidate) => candidate.lengthM < 5000).length >= 3,
+    'real catalog includes three short stages alongside the eight existing routes and Superstrada');
+  ok(routeCatalog[0].id === 'route-1' &&
     routeCatalog.every((candidate) => candidate.checkpoints.length === ROUTE_CHECKPOINT_COUNT &&
       candidate.lengthM > 0 &&
       candidate.checkpoints[0][0] === candidate.start.x &&
@@ -974,6 +1257,72 @@ try {
       candidate.checkpoints[ROUTE_CHECKPOINT_COUNT - 1][0] === candidate.end.x &&
       candidate.checkpoints[ROUTE_CHECKPOINT_COUNT - 1][1] === candidate.end.z),
   'real map exposes a deterministic catalog whose routes all have exactly ten checkpoints');
+  const legacyCatalog = createRouteCatalog(graph, map, { maxRoutes: 8 });
+  ok(JSON.stringify(routeCatalog.slice(0, 8)) === JSON.stringify(legacyCatalog) &&
+    legacyCatalog.every((candidate, i) => candidate.id === `route-${i + 1}`),
+  'all eight legacy route IDs, paths and checkpoints remain unchanged');
+  ok(JSON.stringify(routeCatalog) === JSON.stringify(createRouteCatalog(graph, map)),
+    'curated routes, IDs and order are deterministic');
+  const curated = routeCatalog.slice(8);
+  const sprintRoutes = curated.filter((candidate) => candidate.label === 'Sprint');
+  const fastRoute = curated.find((candidate) => candidate.id === 'dogana-stradone-superstrada');
+  ok(sprintRoutes.length === 3 && sprintRoutes.every((candidate) =>
+    candidate.lengthM > 1000 && candidate.lengthM < 5000) &&
+    sprintRoutes.map((candidate) => candidate.start.name).join('|') === 'Borgo Maggiore|Murata|Fiorentino',
+  'three distinct short stages start in Borgo, Murata and Fiorentino and stay below five kilometres');
+  const stradoneTarget = map.proj.toLocal(STRADONE_FINISH.lon, STRADONE_FINISH.lat);
+  ok(curated.length === 4 && curated.every((candidate) =>
+    candidate.end.name === STRADONE_FINISH.name &&
+    Math.hypot(candidate.end.x - stradoneTarget.x, candidate.end.z - stradoneTarget.z) < 0.1 &&
+    index.query(candidate.end.x, candidate.end.z).streetName === STRADONE_FINISH.name),
+  'all four curated finishes lie on the named Stradone road rather than the city centroid');
+  const followsGraph = (candidate, roadGraph) => {
+    const nodes = candidate.path.map(([x, z]) => roadGraph.nearestNode(x, z));
+    return nodes.every((id, i) => {
+      const node = roadGraph.nodes[id];
+      return node && Math.hypot(node.x - candidate.path[i][0], node.z - candidate.path[i][1]) < 0.1 &&
+        (i === 0 || roadGraph.adj[nodes[i - 1]].some(([neighbor]) => neighbor === id));
+    });
+  };
+  ok(curated.every((candidate) => followsGraph(candidate, graph) &&
+    candidate.checkpoints.every(([x, z]) => index.query(x, z).onRoad)),
+  'every curated path edge exists in the road graph and every race checkpoint lies on a road');
+  const fastGraph = new RoadGraph(map.roads.filter(isSuperstradaRoad));
+  const fastRoadSequence = [];
+  let mainRoadLength = 0;
+  for (let i = 1; i < fastRoute.path.length; i++) {
+    const [ax, az] = fastRoute.path[i - 1];
+    const [bx, bz] = fastRoute.path[i];
+    const name = fastGraph.roadIndex.query((ax + bx) / 2, (az + bz) / 2).streetName;
+    if (name !== fastRoadSequence.at(-1)) fastRoadSequence.push(name);
+    if (SUPERSTRADA_ROAD_NAMES.includes(name)) mainRoadLength += Math.hypot(bx - ax, bz - az);
+  }
+  ok(fastRoute.start.name === 'Dogana' && fastRoute.label === 'Superstrada' &&
+    fastGraph.roadIndex.query(fastRoute.start.x, fastRoute.start.z).streetName === 'Via Tre Settembre' &&
+    fastRoute.lengthM > 10000 && fastRoute.lengthM < 12000 && followsGraph(fastRoute, fastGraph),
+  'Dogana starts on Via Tre Settembre and follows only the fast corridor and its final city access');
+  ok(SUPERSTRADA_ROAD_NAMES.every((name, i) => fastRoadSequence.includes(name) &&
+    (i === 0 || fastRoadSequence.indexOf(name) > fastRoadSequence.indexOf(SUPERSTRADA_ROAD_NAMES[i - 1]))) &&
+    mainRoadLength / fastRoute.lengthM > 0.75,
+  'Superstrada visits all five main sections in order with over 75 percent on the principal road');
+  ok(createRouteCatalog(graph, { ...map, proj: undefined }).length === 8,
+    'fixtures without a geographic projection keep their legacy catalog');
+  const noStradoneMap = { ...map, roads: map.roads.filter((road) => road.name !== STRADONE_FINISH.name) };
+  ok(createRouteCatalog(new RoadGraph(noStradoneMap.roads), noStradoneMap).length === 8,
+    'a missing named finish cannot silently snap the four curated routes to another road');
+  const brokenFastMap = { ...map, roads: map.roads.filter((road) => road.name !== 'Via Cinque Febbraio') };
+  ok(!createRouteCatalog(new RoadGraph(brokenFastMap.roads), brokenFastMap)
+    .some((candidate) => candidate.id === fastRoute.id),
+  'a disconnected fast corridor is omitted rather than replaced with a straight line or a shortcut');
+  const noMurataMap = { ...map, places: map.places.filter((place) => place.name !== 'Murata') };
+  const noMurataCatalog = createRouteCatalog(graph, noMurataMap);
+  ok(noMurataCatalog.length === 11 && !noMurataCatalog.some((candidate) => candidate.id === 'sprint-murata-stradone'),
+    'a missing curated start leaves the other three stages available');
+  const expandedCatalog = createRouteCatalog(graph, map, { maxRoutes: 100 });
+  ok(expandedCatalog.length === 32 && new Set(expandedCatalog.map((candidate) => candidate.id)).size === 32 &&
+    createRouteCatalog(graph, map, { maxRoutes: 9 }).length === 9 &&
+    createRouteCatalog(graph, map, { maxRoutes: 1 })[0].id === 'route-1',
+  'catalog limits are honored with unique legacy and curated IDs and an unchanged default');
   ok(routeCatalog.every((candidate) => {
     const [start, next] = candidate.path;
     const dx = next[0] - start[0];
@@ -1194,7 +1543,17 @@ try {
   const elevatedPositions = elevatedOverlay.ribbonGeometry.getAttribute('position');
   ok(elevatedPositions.getY(0) === 100.25 &&
     elevatedPositions.getY(elevatedPositions.count - 1) === 124.25,
-    'route ribbon follows terrain height at both ends');
+  'route ribbon follows terrain height at both ends');
+  const profiledOverlay = createRouteOverlayGeometries([[0, 0, 10], [20, 0, 14]], {
+    heightAt: () => 999
+  });
+  const profiledPositions = profiledOverlay.ribbonGeometry.getAttribute('position');
+  const profiledDashes = profiledOverlay.dashGeometry.getAttribute('position');
+  ok(profiledPositions.getY(0) === 10.25 && profiledPositions.getY(1) === 10.25 &&
+    profiledPositions.getY(2) === 14.25 &&
+    Array.from({ length: profiledDashes.count }, (_, index) => profiledDashes.getY(index))
+      .every((height) => height >= 10.25 && height <= 14.25),
+  'pre-profiled route points keep both guide edges on one plane without resampling another road');
   const curvedHeight = (x) => 4 * Math.sin(Math.PI * x / 48);
   const curvedOverlay = createRouteOverlayGeometries([[0, 0], [48, 0]], {
     heightAt: curvedHeight
@@ -1225,7 +1584,8 @@ try {
     return count >= (candidateRoute.path.length - 1) * 6 && count / 3 <= 40000;
   }), 'real route adaptive draping keeps every overlay below 40,000 triangles');
   ok(createRouteOverlayGeometries([[0, 0]]) === null &&
-    createRouteOverlayGeometries([[0, 0], [Number.NaN, 1]]) === null,
+    createRouteOverlayGeometries([[0, 0], [Number.NaN, 1]]) === null &&
+    createRouteOverlayGeometries([[0, 0, Number.NaN], [1, 1, 2]]) === null,
     'route overlay rejects short or non-finite paths before creating geometry');
   ok(routeOverlayKey([[0, 0], [10, 0]]) === routeOverlayKey([[0, 0], [10, 0]]) &&
     routeOverlayKey([[0, 0], [10, 0]]) !== routeOverlayKey([[0, 0], [0, 10]]),
@@ -1236,6 +1596,8 @@ try {
   widthOverlay.dashGeometry.dispose();
   elevatedOverlay.ribbonGeometry.dispose();
   elevatedOverlay.dashGeometry.dispose();
+  profiledOverlay.ribbonGeometry.dispose();
+  profiledOverlay.dashGeometry.dispose();
   curvedOverlay.ribbonGeometry.dispose();
   curvedOverlay.dashGeometry.dispose();
   for (const { overlay: candidate } of realRouteOverlays) {
@@ -1297,6 +1659,33 @@ try {
     turnCueHtml.includes('id="turn-cue-path"'),
   'turn cue markup exposes a static SVG and polite live status without generated HTML');
 
+  console.log('== weather view (unit) ==');
+  const weatherOptions = publicWeatherOptions();
+  ok(DEFAULT_WEATHER_ID === 'clear' && WEATHER_PRESETS.length === 3 &&
+    weatherOptions.map((option) => option.label).join(',') === 'Sereno,Nuvoloso,Nebbia' &&
+    normalizeWeatherId('fog') === 'fog' && normalizeWeatherId('<bad>') === 'clear',
+  'weather catalog has three deterministic Italian presets and a clear fallback');
+  const weatherWorldView = { fogNear: 3400, fogFar: 19000, cameraFar: 21100 };
+  const clearWeather = weatherViewForWorld('clear', weatherWorldView);
+  const cloudyWeather = weatherViewForWorld('cloudy', weatherWorldView);
+  const fogWeather = weatherViewForWorld('fog', weatherWorldView);
+  ok(clearWeather.fogNear > cloudyWeather.fogNear && clearWeather.fogFar > cloudyWeather.fogFar &&
+    fogWeather.fogNear < cloudyWeather.fogNear && fogWeather.fogFar < cloudyWeather.fogFar &&
+    clearWeather.directionalIntensity > cloudyWeather.directionalIntensity &&
+    cloudyWeather.directionalIntensity > fogWeather.directionalIntensity,
+  'clear, cloudy and fog presets have distinct finite visibility and light levels');
+  const malformedWeather = weatherViewForWorld('storm', {
+    fogNear: Number.NaN,
+    fogFar: Infinity,
+    cameraFar: -1
+  });
+  ok(malformedWeather.id === 'clear' && Number.isFinite(malformedWeather.fogNear) &&
+    malformedWeather.fogNear < malformedWeather.fogFar &&
+    malformedWeather.fogFar < malformedWeather.cameraFar,
+  'malformed weather and world values use one finite clear fallback');
+  ok(turnCueHtml.includes('id="weather-select"') && turnCueHtml.includes('for="weather-select"'),
+    'weather selector has a persistent labelled lobby control');
+
   console.log('== client UI (unit) ==');
   let streetState = createStreetBannerState();
   let streetView = advanceStreetBanner(streetState, 'Via Uno', 1000, {
@@ -1345,6 +1734,13 @@ try {
       { id: 'route-1', start: 'duplicate', end: 'ignored', lengthKm: 2, checkpoints: 3 }
     ],
     selectedRouteId: 'route-1',
+    weatherOptions: [
+      { id: 'clear', label: 'Sereno' },
+      { id: 'fog', label: 'Nebbia' },
+      { id: '<bad>', label: 'Ignora' },
+      { id: 'clear', label: 'Duplicato' }
+    ],
+    selectedWeatherId: 'fog',
     locked: false,
     phase: 'waiting',
     capacity: 4,
@@ -1357,13 +1753,23 @@ try {
   });
   ok(normalizedLobby.options.length === 1 && normalizedLobby.selectedRouteId === 'route-1' &&
     !normalizedLobby.locked && normalizedLobby.options[0].lengthKm === 12.34 &&
+    normalizedLobby.weatherOptions.length === 2 && normalizedLobby.selectedWeatherId === 'fog' &&
     normalizedLobby.players.length === 2 && normalizedLobby.players[1].name === '<img src=x>' &&
     normalizedLobby.players[1].color === '#8b949e' && !normalizedLobby.players[1].ready,
   'client accepts a bounded route catalog and rejects malformed or duplicate options');
+  const labeledLobby = normalizeRouteLobby({ routeOptions: [
+    { id: 'sprint', start: 'A', end: 'B', label: ' Sprint ' },
+    { id: 'fast', start: 'A', end: 'B', label: '<img src=x>'.repeat(20) },
+    { id: 'legacy', start: 'A', end: 'B', label: { value: 'invalid' } }
+  ] });
+  ok(labeledLobby.options[0].label === 'Sprint' && labeledLobby.options[1].label.length === 80 &&
+    labeledLobby.options[1].label.startsWith('<img src=x>') && labeledLobby.options[2].label === '' &&
+    normalizedLobby.options[0].label === '',
+  'route labels are bounded plain text and malformed or older payloads retain an empty fallback');
   const hostLobbyView = lobbyView(normalizedLobby, 2);
   ok(hostLobbyView.visible && hostLobbyView.isHost && hostLobbyView.ready && !hostLobbyView.canStart &&
-    hostLobbyView.canChangeRoute,
-  'host lobby view can change route but cannot start until every player is ready');
+    hostLobbyView.canChangeRoute && hostLobbyView.canChangeWeather,
+  'host lobby view can change route and weather but cannot start until every player is ready');
   const allReadyLobby = normalizeRouteLobby({
     ...normalizedLobby,
     routeOptions: [{ id: 'route-1', start: 'A', end: 'B', lengthKm: 12.34, checkpoints: 44 }],
@@ -1373,6 +1779,7 @@ try {
     'only the ready host can start an all-ready lobby');
   const emptyLobby = normalizeRouteLobby(null);
   ok(emptyLobby.options.length === 0 && emptyLobby.selectedRouteId === '' && !emptyLobby.locked &&
+    emptyLobby.weatherOptions.length === 0 && emptyLobby.selectedWeatherId === '' &&
     emptyLobby.phase === 'waiting' && emptyLobby.hostId === null && emptyLobby.players.length === 0,
     'malformed lobby payload uses an empty deterministic fallback');
   const keyboardInput = readDrivingInput(new Set(['ArrowUp', 'KeyA', 'Space']));
@@ -1423,15 +1830,29 @@ try {
 
   const visualCar = createCarModel('#ffffff');
   const visualCarSize = new THREE.Box3().setFromObject(visualCar).getSize(new THREE.Vector3());
-  ok(Math.abs(visualCarSize.x - CAR_VISUAL.outerWidth) < 1e-6 && visualCarSize.x <= 1.800001,
-    'rendered car outer width is at most 1.80 metres');
-  ok(Math.abs(visualCarSize.z - CAR_VISUAL.bodyLength) < 1e-6 &&
-    visualCarSize.z <= CAR_RADIUS * 2 + 1e-6,
-  'rendered car length stays aligned with its collision footprint');
-  ok(CAR_RADIUS >= Math.hypot(CAR_VISUAL.bodyWidth / 2, CAR_VISUAL.bodyLength / 2),
-    'collision radius contains every corner of the rendered body');
-  ok(CAR_VISUAL.outerWidth === CAR_FOOTPRINT.width && CAR_VISUAL.bodyLength === CAR_FOOTPRINT.length,
-    'rendered car dimensions share the authoritative oriented building footprint');
+  ok(Math.abs(visualCarSize.x - CAR_VISUAL.outerWidth) < 1e-6 && visualCarSize.x <= 1.720001 &&
+    visualCarSize.x < CAR_FOOTPRINT.width,
+  'rendered car is visibly narrower while remaining inside the authoritative footprint');
+  ok(Math.abs(visualCarSize.z - CAR_VISUAL.outerLength) < 1e-6 &&
+    visualCarSize.z <= 3.220001 && visualCarSize.z < CAR_FOOTPRINT.length,
+  'rendered car is visibly shorter while remaining inside the authoritative footprint');
+  ok(visualCarSize.y <= 1.140001,
+    'rendered car has a lower compact rally silhouette');
+  const bodyShell = visualCar.getObjectByName('body-shell');
+  const bodyAbsWidths = new Set(Array.from(bodyShell?.geometry?.getAttribute('position')?.array || [])
+    .filter((_, index) => index % 3 === 0)
+    .map((value) => Math.abs(value).toFixed(3)));
+  const wheels = visualCar.getObjectByName('wheels');
+  ok(bodyAbsWidths.size >= 4 && wheels?.userData?.shape === 'cylinder' &&
+    wheels.userData.count === 4,
+  'tapered body and four cylindrical wheels replace the all-box silhouette');
+  ok(visualCar.getObjectByName('headlights')?.position.z < 0 &&
+    visualCar.getObjectByName('tail-lights')?.position.z > 0,
+  'front and rear light details preserve the -z forward convention');
+  ok(visualCar.children.length <= 6,
+    'the more detailed car does not increase the previous six-mesh render budget');
+  ok(CAR_RADIUS >= Math.hypot(CAR_VISUAL.outerWidth / 2, CAR_VISUAL.outerLength / 2),
+    'collision radius still contains every corner of the compact rendered car');
   ok(visualCar.rotation.order === 'YXZ',
     'rendered car applies local pitch and roll after its authoritative yaw');
   disposeObject3D(visualCar);
@@ -1491,6 +1912,8 @@ try {
   const asphaltTargets = engineTargets({ speed: 18, rpm: 4200, brakeLevel: 0, surface: 'asphalt' });
   const shoulderTargets = engineTargets({ speed: 18, rpm: 4200, brakeLevel: 0, surface: 'shoulder' });
   const trackTargets = engineTargets({ speed: 18, rpm: 4200, brakeLevel: 0, surface: 'track' });
+  const gravelTargets = engineTargets({ speed: 18, rpm: 4200, brakeLevel: 0, surface: 'gravel' });
+  const mudTargets = engineTargets({ speed: 18, rpm: 4200, brakeLevel: 0, surface: 'mud' });
   const grassTargets = engineTargets({ speed: 12, rpm: 4200, brakeLevel: 0, surface: 'grass' });
   ok(asphaltTargets.surfaceGain === 0 && shoulderTargets.surfaceGain > 0 &&
     shoulderTargets.surfaceGain < trackTargets.surfaceGain && trackTargets.surfaceGain > 0 &&
@@ -1500,20 +1923,30 @@ try {
     trackTargets.surfaceFrequency !== grassTargets.surfaceFrequency &&
     asphaltTargets.frequency !== trackTargets.frequency && trackTargets.frequency !== grassTargets.frequency,
   'shoulder adds light rolling noise without changing asphalt engine targets');
+  ok(gravelTargets.surfaceGain > 0 && mudTargets.surfaceGain > 0 &&
+    gravelTargets.frequency === trackTargets.frequency &&
+    mudTargets.surfaceFrequency === trackTargets.surfaceFrequency,
+  'gravel and mud preserve the existing loose-surface engine and rolling audio');
   ok(normalizeSurfaceSnapshot({ surface: 'shoulder', onRoad: false }).surface === SURFACE.SHOULDER &&
     normalizeSurfaceSnapshot({ surface: 'track', onRoad: true }).surface === SURFACE.TRACK &&
+    normalizeSurfaceSnapshot({ surface: 'gravel', onRoad: true }).surface === SURFACE.GRAVEL &&
+    normalizeSurfaceSnapshot({ surface: 'mud', onRoad: true }).surface === SURFACE.MUD &&
     normalizeSurfaceSnapshot({ surface: '<bad>', onRoad: false }).surface === SURFACE.GRASS &&
     normalizeSurfaceSnapshot({ onRoad: true }).surface === SURFACE.ASPHALT,
   'surface snapshot normalization accepts the bounded protocol and preserves legacy fallbacks');
   const asphaltShake = surfaceShake(SURFACE.ASPHALT, 20, 1.25, 1);
   const shoulderShake = surfaceShake(SURFACE.SHOULDER, 20, 1.25, 1);
   const trackShake = surfaceShake(SURFACE.TRACK, 20, 1.25, 1);
+  const gravelShake = surfaceShake(SURFACE.GRAVEL, 20, 1.25, 1);
+  const mudShake = surfaceShake(SURFACE.MUD, 20, 1.25, 1);
   ok(asphaltShake.y === 0 && asphaltShake.pitch === 0 && asphaltShake.roll === 0 &&
     shoulderShake.y === 0 && shoulderShake.pitch === 0 && shoulderShake.roll === 0 &&
     Object.values(trackShake).every(Number.isFinite) && Math.abs(trackShake.y) <= 0.08 &&
     Math.abs(trackShake.pitch) <= 0.04 && Math.abs(trackShake.roll) <= 0.03 &&
+    JSON.stringify(gravelShake) === JSON.stringify(trackShake) &&
+    JSON.stringify(mudShake) === JSON.stringify(trackShake) &&
     JSON.stringify(trackShake) === JSON.stringify(surfaceShake(SURFACE.TRACK, 20, 1.25, 1)),
-  'dirt shaker is deterministic, finite and bounded while asphalt and shoulder remain stable');
+  'loose-surface shaker covers dirt, gravel and mud while asphalt and shoulder remain stable');
   ok(engineTargets(selectLocalSnapshot(audioSnapshots, 3)).gain === 0 &&
     engineTargets(selectLocalSnapshot(audioSnapshots, 3)).brakeGain === 0,
   'missing local car mutes engine and braking');
@@ -1943,16 +2376,26 @@ try {
   const lobby1P = waitFor(sock1, 'lobby');
   await waitFor(sock1, 'connect');
   const lobby1 = await lobby1P;
-  ok(lobby1.locked === false && lobby1.routeOptions.length === 8,
-    'a connected pre-join client receives eight unlocked real route choices');
-  const hostRouteId = lobby1.routeOptions[1].id;
+  ok(lobby1.locked === false && lobby1.routeOptions.length === 12 &&
+    lobby1.routeOptions.filter((option) => option.label === 'Sprint' && option.lengthKm < 5).length === 3 &&
+    lobby1.weatherOptions.length === 3 && lobby1.selectedWeatherId === 'clear',
+  'a connected pre-join client receives unlocked route and weather choices with clear default');
+  const hostRouteId = 'sprint-borgo-stradone';
   const pInit1 = waitFor(sock1, 'init');
   const joinedLobby1P = waitFor(sock1, 'lobby', (lobby) => lobby.players?.length === 1);
-  sock1.emit('join', { name: '  Alice  ', color: '#AaBbCc', routeId: hostRouteId });
+  sock1.emit('join', {
+    name: '  Alice  ',
+    color: '#AaBbCc',
+    routeId: hostRouteId,
+    weatherId: 'fog'
+  });
   const [i1, joinedLobby1] = await Promise.all([pInit1, joinedLobby1P]);
   ok(i1.you === 1, 'first player gets seat 1');
   ok(i1.host === true && i1.routeId === hostRouteId && s.route.id === hostRouteId,
     'the first player is host and fixes the selected authoritative route');
+  ok(i1.weatherId === 'fog' && joinedLobby1.selectedWeatherId === 'fog' &&
+    s.getWeatherId() === 'fog',
+  'the first player fixes one authoritative weather preset for the lobby');
   ok(joinedLobby1.phase === 'waiting' && joinedLobby1.hostId === 1 &&
     joinedLobby1.players[0].ready === false,
   'first player enters an explicit unready lobby as host');
@@ -1965,7 +2408,8 @@ try {
   'init delivers the raw A* path and junction directions separately from checkpoints');
 
   const st1 = await waitFor(sock1, 'state');
-  ok(st1.phase === 'waiting' && st1.running === false, 'first player does not start countdown');
+  ok(st1.phase === 'waiting' && st1.running === false && st1.weatherId === 'fog',
+    'first player does not start countdown and state keeps authoritative weather');
   ok(st1.countdown === START_DELAY_MAX_MS / 1000,
     'waiting lobby preserves the configured start delay');
   const duplicateInitP = waitFor(sock1, 'init');
@@ -1976,6 +2420,7 @@ try {
     'duplicate join reuses deterministic junction directions');
   ok(duplicateInit.phase === st1.phase && duplicateInit.countdown === st1.countdown,
     'duplicate join reports the current waiting state');
+  ok(duplicateInit.weatherId === 'fog', 'duplicate join keeps the authoritative weather');
   ok(s.cars.size === 1 && s.inputs.size === 1, 'duplicate join does not create ghost state');
 
   sock1.emit('input', { u: 2, a: -2, h: true });
@@ -2008,39 +2453,74 @@ try {
   const lobby2P = waitFor(sock2, 'lobby');
   await waitFor(sock2, 'connect');
   const lobby2 = await lobby2P;
-  ok(lobby2.locked === false && lobby2.selectedRouteId === hostRouteId && lobby2.hostId === 1,
-    'later clients see the host selection while the lobby remains open');
+  ok(lobby2.locked === false && lobby2.selectedRouteId === hostRouteId &&
+    lobby2.selectedWeatherId === 'fog' && lobby2.hostId === 1,
+  'later clients see the host route and weather while the lobby remains open');
   const pInit2 = waitFor(sock2, 'init');
   const joinedLobby2P = waitFor(sock2, 'lobby', (lobby) => lobby.players?.length === 2);
   sock2.emit('join', { routeId: lobby1.routeOptions[0].id });
   const [i2, joinedLobby2] = await Promise.all([pInit2, joinedLobby2P]);
   ok(i2.you === 2, 'second player gets seat 2');
-  ok(i2.host === false && i2.routeId === hostRouteId,
-    'a non-host route choice cannot replace the authoritative selection');
+  ok(i2.host === false && i2.routeId === hostRouteId && i2.weatherId === 'fog',
+    'a non-host route or omitted weather choice cannot replace the authoritative selection');
   ok(JSON.stringify(i2.routeDirections) === JSON.stringify(i1.routeDirections),
     'two clients receive identical junction directions');
   ok(i2.name === 'P2' && i2.color === '#3b6fe2', 'incomplete join payload uses deterministic defaults');
   ok(joinedLobby2.players.every((player) => !player.ready),
     'a changed player set resets every ready state');
 
+  const readyBeforeWeatherP = waitFor(sock1, 'lobby', (lobby) =>
+    lobby.players?.length === 2 && lobby.players.every((player) => player.ready));
+  sock1.emit('lobby:ready', { ready: true });
+  sock2.emit('lobby:ready', { ready: true });
+  await readyBeforeWeatherP;
+  const beforeMalformedWeather = await waitFor(sock1, 'state');
+  sock1.emit('lobby:weather', null);
+  sock1.emit('lobby:weather', { weatherId: 'storm' });
+  const afterMalformedWeather = await waitFor(sock1, 'state', (state) =>
+    state.t > beforeMalformedWeather.t);
+  ok(afterMalformedWeather.weatherId === 'fog' &&
+    [...s.readyById.values()].every((ready) => ready),
+  'malformed host weather payloads preserve the preset and every ready state');
+  const beforeUnauthorizedWeather = afterMalformedWeather;
+  sock2.emit('lobby:weather', { weatherId: 'clear' });
+  const afterUnauthorizedWeather = await waitFor(sock1, 'state', (state) =>
+    state.t > beforeUnauthorizedWeather.t);
+  ok(afterUnauthorizedWeather.weatherId === 'fog' && s.getWeatherId() === 'fog',
+    'a non-host cannot change authoritative weather');
+  const changedWeatherLobbyP = waitFor(sock1, 'lobby', (lobby) =>
+    lobby.selectedWeatherId === 'cloudy' && lobby.players.every((player) => !player.ready));
+  const changedWeatherStateP = waitFor(sock2, 'state', (state) => state.weatherId === 'cloudy');
+  sock1.emit('lobby:weather', { weatherId: 'cloudy' });
+  const [changedWeatherLobby, changedWeatherState] = await Promise.all([
+    changedWeatherLobbyP,
+    changedWeatherStateP
+  ]);
+  ok(changedWeatherLobby.selectedWeatherId === 'cloudy' &&
+    changedWeatherState.weatherId === 'cloudy' && s.getWeatherId() === 'cloudy',
+  'host weather change is synchronized and resets every ready state');
   const readyBeforeRouteP = waitFor(sock1, 'lobby', (lobby) =>
     lobby.players?.length === 2 && lobby.players.every((player) => player.ready));
   sock1.emit('lobby:ready', { ready: true });
   sock2.emit('lobby:ready', { ready: true });
   await readyBeforeRouteP;
-  const changedRouteId = lobby1.routeOptions[6].id;
+  const changedRouteId = 'dogana-stradone-superstrada';
   const changedRouteLobbyP = waitFor(sock1, 'lobby', (lobby) =>
     lobby.selectedRouteId === changedRouteId && lobby.players.every((player) => !player.ready));
   const changedRouteInit1P = waitFor(sock1, 'init', (init) => init.routeId === changedRouteId);
   const changedRouteInit2P = waitFor(sock2, 'init', (init) => init.routeId === changedRouteId);
   sock1.emit('lobby:route', { routeId: changedRouteId });
-  const [changedRouteLobby, changedRouteInit1] = await Promise.all([
+  const [changedRouteLobby, changedRouteInit1, changedRouteInit2] = await Promise.all([
     changedRouteLobbyP,
     changedRouteInit1P,
     changedRouteInit2P
   ]);
   ok(s.route.id === changedRouteId && changedRouteLobby.players.every((player) => !player.ready),
     'host route change respawns the grid and resets readiness for all players');
+  ok(changedRouteInit1.end.name === STRADONE_FINISH.name &&
+    JSON.stringify(changedRouteInit1.routePath) === JSON.stringify(changedRouteInit2.routePath) &&
+    changedRouteLobby.routeOptions.find((option) => option.id === changedRouteId)?.label === 'Superstrada',
+  'both clients receive the same new Superstrada path and its named Stradone finish');
   const routeStartDx = changedRouteInit1.routePath[2] - changedRouteInit1.routePath[0];
   const routeStartDz = changedRouteInit1.routePath[3] - changedRouteInit1.routePath[1];
   const routeStartLength = Math.hypot(routeStartDx, routeStartDz);
@@ -2162,8 +2642,9 @@ try {
   const movingCarA = movingA.cars.find((c) => c.id === 1);
   ok(Number.isFinite(movingCarA.rpm) && Number.isInteger(movingCarA.gear) &&
     movingCarA.brakeLevel === 0 && movingCarA.handbrake === false &&
-    movingCarA.surface === SURFACE.ASPHALT,
-  'running snapshots expose finite authoritative drivetrain state');
+    movingCarA.surface === SURFACE.ASPHALT &&
+    !Object.hasOwn(movingCarA, 'surfaceDriftPhase'),
+  'running snapshots expose finite drivetrain state without publishing internal drift phase');
   ok(Math.hypot(movingCarA.x - startA.x, movingCarA.z - startA.z) > 1, 'car moves after running begins');
   sockA.emit('input', { u: 0, a: 0, h: true });
   const handbrakingA = await waitFor(sockA, 'state', (d) => {

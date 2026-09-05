@@ -16,7 +16,13 @@ const MAX_DRAPE_DEPTH = 12;
 const JUNCTION_OVERLAP = 0.08;
 const JUNCTION_CAP_SEGMENTS = 10;
 const JUNCTION_SURFACE_LIFT = 0.004;
-const SHOULDER_DARKEN_FACTOR = 0.78;
+
+export const PAVED_ROAD_RENDER_COLOR = ROAD_CLASSES.residential.color;
+
+export function roadRenderColor(road) {
+  if (road?.isUnpaved && Number.isInteger(road.color)) return road.color;
+  return PAVED_ROAD_RENDER_COLOR;
+}
 
 function roadPriority(road) {
   if (Number.isFinite(road.priority)) return road.priority;
@@ -29,12 +35,6 @@ function roadHasShoulder(road) {
 
 function roadShoulderY(road) {
   return Math.max(0.005, road.y - 0.006);
-}
-
-function darkerRoadColor(color) {
-  const value = Number.isInteger(color) ? color : 0x545b64;
-  const channel = (shift) => Math.round(((value >> shift) & 0xff) * SHOULDER_DARKEN_FACTOR);
-  return (channel(16) << 16) | (channel(8) << 8) | channel(0);
 }
 
 function roadDirection(points, index) {
@@ -148,10 +148,14 @@ function pointAtDistance(points, distances, distance) {
   while (index < distances.length - 2 && distances[index + 1] < distance) index++;
   const segmentLength = distances[index + 1] - distances[index] || 1;
   const t = (distance - distances[index]) / segmentLength;
-  return [
+  const point = [
     points[index][0] + (points[index + 1][0] - points[index][0]) * t,
     points[index][1] + (points[index + 1][1] - points[index][1]) * t
   ];
+  if (Number.isFinite(points[index][2]) && Number.isFinite(points[index + 1][2])) {
+    point.push(points[index][2] + (points[index + 1][2] - points[index][2]) * t);
+  }
+  return point;
 }
 
 function roadRun(points, distances, start, end) {
@@ -252,6 +256,7 @@ function refineSections(start, end, heightAt, y, tolerance, depth, output, known
 }
 
 function drapedSections(points, halfWidth, y, heightAt, verticalScale) {
+  const hasProfileHeights = points.every((point) => Number.isFinite(point[2]));
   const base = [];
   for (let index = 0; index < points.length; index++) {
     const point = points[index];
@@ -268,12 +273,15 @@ function drapedSections(points, halfWidth, y, heightAt, verticalScale) {
     const leftZ = point[1] + nz * halfWidth;
     const rightX = point[0] - nx * halfWidth;
     const rightZ = point[1] - nz * halfWidth;
+    const centerHeight = hasProfileHeights ? point[2] : finiteHeight(heightAt, point[0], point[1]);
     base.push({
-      left: { x: leftX, y: finiteHeight(heightAt, leftX, leftZ) + y, z: leftZ },
-      center: { x: point[0], y: finiteHeight(heightAt, point[0], point[1]) + y, z: point[1] },
-      right: { x: rightX, y: finiteHeight(heightAt, rightX, rightZ) + y, z: rightZ }
+      left: { x: leftX, y: hasProfileHeights ? centerHeight + y : finiteHeight(heightAt, leftX, leftZ) + y, z: leftZ },
+      center: { x: point[0], y: centerHeight + y, z: point[1] },
+      right: { x: rightX, y: hasProfileHeights ? centerHeight + y : finiteHeight(heightAt, rightX, rightZ) + y, z: rightZ }
     });
   }
+
+  if (hasProfileHeights) return base;
 
   const sections = [base[0]];
   const tolerance = Math.max(0.002, Math.min(0.04, Math.max(0.001, y) * 0.8)) *
@@ -355,7 +363,15 @@ function ribbonGeometry(points, halfWidth, y, color, heightAt, verticalScale) {
   return geometry;
 }
 
-function junctionCapGeometry(junctions, selectIncident, radiusFor, yFor, colorFor, heightAt) {
+function junctionCapGeometry(
+  junctions,
+  selectIncident,
+  radiusFor,
+  yFor,
+  colorFor,
+  heightAt,
+  heightAtForRoad
+) {
   const positions = [];
   const colors = [];
   const uvs = [];
@@ -364,17 +380,19 @@ function junctionCapGeometry(junctions, selectIncident, radiusFor, yFor, colorFo
     const incident = selectIncident(junction);
     if (!incident) continue;
     const { road } = incident;
+    const roadHeightAt = heightAtForRoad(road);
     const radius = radiusFor(road) + JUNCTION_OVERLAP;
     const cx = junction.point[0];
     const cz = junction.point[1];
     const y = yFor(road);
-    const center = { x: cx, y: finiteHeight(heightAt, cx, cz) + y, z: cz };
+    const capHeight = finiteHeight(roadHeightAt, cx, cz) + y;
+    const center = { x: cx, y: capHeight, z: cz };
     const ring = [];
     for (let index = 0; index < JUNCTION_CAP_SEGMENTS; index++) {
       const angle = (index / JUNCTION_CAP_SEGMENTS) * Math.PI * 2;
       const x = cx + Math.cos(angle) * radius;
       const z = cz + Math.sin(angle) * radius;
-      ring.push({ x, y: finiteHeight(heightAt, x, z) + y, z });
+      ring.push({ x, y: capHeight, z });
     }
     let lift = 0;
     for (let index = 0; index < JUNCTION_CAP_SEGMENTS; index++) {
@@ -382,7 +400,7 @@ function junctionCapGeometry(junctions, selectIncident, radiusFor, yFor, colorFo
         center,
         ring[index],
         ring[(index + 1) % JUNCTION_CAP_SEGMENTS]
-      ], heightAt));
+      ], roadHeightAt));
     }
     const vertexColor = new THREE.Color(colorFor(road));
     for (let index = 0; index < JUNCTION_CAP_SEGMENTS; index++) {
@@ -428,6 +446,9 @@ function dashGeometry(points, y, width, color, dashLength, gap, heightAt) {
     return {
       x: a[0] + (b[0] - a[0]) * t,
       z: a[1] + (b[1] - a[1]) * t,
+      roadHeight: Number.isFinite(a[2]) && Number.isFinite(b[2])
+        ? a[2] + (b[2] - a[2]) * t
+        : null,
       dx: (b[0] - a[0]) / length,
       dz: (b[1] - a[1]) / length
     };
@@ -446,7 +467,9 @@ function dashGeometry(points, y, width, color, dashLength, gap, heightAt) {
       [point2.x + nx, point2.z + nz],
       [point2.x - nx, point2.z - nz]
     ];
-    const heights = quad.map(([x, z]) => finiteHeight(heightAt, x, z) + y);
+    const heights = point1.roadHeight !== null && point2.roadHeight !== null
+      ? [point1.roadHeight + y, point1.roadHeight + y, point2.roadHeight + y, point2.roadHeight + y]
+      : quad.map(([x, z]) => finiteHeight(heightAt, x, z) + y);
     let lift = 0;
     for (const triangle of [[0, 1, 2], [1, 3, 2]]) {
       const x = triangle.reduce((sum, index) => sum + quad[index][0], 0) / 3;
@@ -487,11 +510,15 @@ function mergeBatch(geometries, merge) {
 
 export function createRoadGeometryBatches(roads, {
   heightAt = () => 0,
+  heightAtForRoad = () => heightAt,
+  pointsForRoad = (road) => road.points,
   verticalScale = 1,
   merge = mergeGeometries
 } = {}) {
   if (!Array.isArray(roads)) throw new TypeError('roads must be an array');
   if (typeof heightAt !== 'function') throw new TypeError('heightAt must be a function');
+  if (typeof heightAtForRoad !== 'function') throw new TypeError('heightAtForRoad must be a function');
+  if (typeof pointsForRoad !== 'function') throw new TypeError('pointsForRoad must be a function');
   if (!Number.isFinite(verticalScale) || verticalScale <= 0) {
     throw new TypeError('verticalScale must be a finite positive number');
   }
@@ -509,16 +536,21 @@ export function createRoadGeometryBatches(roads, {
   let dashedSources = 0;
   for (let roadIndex = 0; roadIndex < roads.length; roadIndex++) {
     const road = roads[roadIndex];
-    const roadRuns = visibleRoadRuns(road, roadExclusions.get(roadIndex));
+    const roadHeightAt = heightAtForRoad(road);
+    if (typeof roadHeightAt !== 'function') throw new TypeError('heightAtForRoad must return a function');
+    const profilePoints = pointsForRoad(road);
+    if (!Array.isArray(profilePoints) || profilePoints.length < 2) continue;
+    const profiledRoad = { ...road, points: profilePoints };
+    const roadRuns = visibleRoadRuns(profiledRoad, roadExclusions.get(roadIndex));
     if (roadHasShoulder(road)) {
-      const shoulderRuns = visibleRoadRuns(road, shoulderExclusions.get(roadIndex));
+      const shoulderRuns = visibleRoadRuns(profiledRoad, shoulderExclusions.get(roadIndex));
       for (const points of shoulderRuns) {
         shoulderGeometries.push(ribbonGeometry(
           points,
           road.width / 2 + ROAD_SHOULDER_WIDTH,
           roadShoulderY(road),
-          darkerRoadColor(road.color),
-          heightAt,
+          roadRenderColor(road),
+          roadHeightAt,
           verticalScale
         ));
       }
@@ -529,15 +561,15 @@ export function createRoadGeometryBatches(roads, {
         points,
         road.width / 2,
         road.y,
-        road.color,
-        heightAt,
+        roadRenderColor(road),
+        roadHeightAt,
         verticalScale
       ));
     }
     if (!DASHED_CLASSES.has(road.cls)) continue;
     let roadHasDashes = false;
     for (const points of roadRuns) {
-      const dashed = dashGeometry(points, road.y + 0.01, 0.16, 0xd9d9d9, 3.5, 9, heightAt);
+      const dashed = dashGeometry(points, road.y + 0.01, 0.16, 0xd9d9d9, 3.5, 9, roadHeightAt);
       if (dashed) {
         dashGeometries.push(dashed);
         roadHasDashes = true;
@@ -553,8 +585,9 @@ export function createRoadGeometryBatches(roads, {
       : null,
     (road) => road.width / 2 + ROAD_SHOULDER_WIDTH,
     (road) => roadShoulderY(road) + JUNCTION_SURFACE_LIFT,
-    (road) => darkerRoadColor(road.color),
-    heightAt
+    roadRenderColor,
+    heightAt,
+    heightAtForRoad
   );
   if (shoulderCaps.geometry) shoulderGeometries.push(shoulderCaps.geometry);
   const roadCaps = junctionCapGeometry(
@@ -562,8 +595,9 @@ export function createRoadGeometryBatches(roads, {
     (junction) => junction.incidents[0].isEndpoint ? junction.incidents[0] : null,
     (road) => road.width / 2,
     (road) => road.y + JUNCTION_SURFACE_LIFT,
-    (road) => road.color,
-    heightAt
+    roadRenderColor,
+    heightAt,
+    heightAtForRoad
   );
   if (roadCaps.geometry) roadGeometries.push(roadCaps.geometry);
 

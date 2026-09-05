@@ -1,7 +1,7 @@
 import assert from 'node:assert';
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
-import { cp, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp as copy, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -34,6 +34,10 @@ import {
   runDownloader,
   sleepAbortable
 } from './fetch-elevation.js';
+import { rebuildElevation } from './rebuild-elevation.js';
+import { parseMapData } from '../shared/mapdata.js';
+import { RoadGraph, createRouteCatalog } from '../shared/route.js';
+import { terrainMeshHeightAt } from '../public/src/world-data.js';
 import {
   BatchExhaustedError,
   ProviderError,
@@ -47,7 +51,8 @@ import {
 } from './elevation-retry.js';
 
 let passed = 0;
-const RUNTIME_BASELINE_SHA256 = '20dba1cf12d5bd28552e2f8bf32c96c3cd37942ec5d9b0f0989396b192c64229';
+const RUNTIME_BASELINE_SHA256 = '316c1c6fc4a271d93f162a7c5a453501a86b96764e8b53a63c34f90bd47ebce3';
+const RAW_BASELINE_SHA256 = '0f47273313943fef4a2027ba73fbc9a837a90d2b0adbbc8d4e5d99b4be158bd8';
 const LEGACY_FIXTURE_URL = new URL('./fixtures/elevation-legacy-6100.json', import.meta.url);
 
 function ok(cond, msg) {
@@ -67,7 +72,7 @@ function trackTemp(dir) {
 async function makeTempDataRoot() {
   const dir = trackTemp(await mkdtemp(join(tmpdir(), 'test-elevation-')));
   const realRoot = join(process.cwd(), 'public', 'data');
-  await cp(join(realRoot, ROADS_FILE_NAME), join(dir, ROADS_FILE_NAME));
+  await copy(join(realRoot, ROADS_FILE_NAME), join(dir, ROADS_FILE_NAME));
   const legacyFixture = JSON.parse(await readFile(LEGACY_FIXTURE_URL, 'utf8'));
   await writeFile(join(dir, LEGACY_FILE_NAME), JSON.stringify(legacyFixture));
   return dir;
@@ -129,6 +134,32 @@ const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 const noopSleep = () => Promise.resolve();
 
 try {
+  console.log('== absolute elevation generation (unit) ==');
+  const absoluteMap = {
+    bbox: { minX: 0, maxX: 600, minZ: 0, maxZ: 600 },
+    roads: [{ points: [[0, 0], [300, 300], [600, 600]] }]
+  };
+  const absoluteDescriptor = gridDescriptor(absoluteMap.bbox);
+  const absoluteArgs = { map: absoluteMap, descriptor: absoluteDescriptor, roadsSha256: 'a'.repeat(64) };
+  const flatAbsolute = buildFinalAsset({ ...absoluteArgs, elev: new Array(49).fill(100) });
+  ok(flatAbsolute.heights.every((height) => height === 100),
+    'a flat 100 metre source remains at 100 metres even beside roads');
+  const rampSource = Float64Array.from({ length: 49 }, (_, i) => -30 + i * 20.123);
+  const rampBefore = Array.from(rampSource);
+  const rampAbsolute = buildFinalAsset({ ...absoluteArgs, elev: rampSource });
+  ok(JSON.stringify(rampAbsolute.heights) === JSON.stringify(rampBefore) &&
+    rampAbsolute.heightReference === 'absolute',
+  'absolute heights preserve slopes, negative values and peaks above 500 metres without rounding or offset');
+  ok(JSON.stringify(Array.from(rampSource)) === JSON.stringify(rampBefore) &&
+    JSON.stringify(buildFinalAsset({ ...absoluteArgs, map: { ...absoluteMap, roads: [] }, elev: rampSource })) ===
+    JSON.stringify(rampAbsolute),
+  'generation neither mutates the source nor changes elevations according to the road layout');
+  for (const invalid of [new Array(48).fill(100), [...rampBefore.slice(0, 48), NaN],
+    [...rampBefore.slice(0, 48), Infinity], [...rampBefore.slice(0, 48), null]]) {
+    assert.throws(() => buildFinalAsset({ ...absoluteArgs, elev: invalid }), /finite|length/);
+  }
+  ok(true, 'incomplete and non-finite source heights are rejected rather than replaced with flat terrain');
+
   console.log('== elevation grid descriptor (unit) ==');
   const synthDesc = gridDescriptor({ minX: -500, maxX: 500, minZ: -300, maxZ: 700 });
   ok(synthDesc.cols === 11 && synthDesc.rows === 11 && synthDesc.total === 121, 'floor+1 formula on a synthetic bbox');
@@ -173,6 +204,42 @@ try {
     'elevation.json is compatible and contains 20.216 finite heights');
   ok(!existsSync(join(realRoot, CHECKPOINT_FILE_NAME)) && !existsSync(join(realRoot, LEGACY_FILE_NAME)),
     'completed elevation has no checkpoint or legacy partial');
+  const sourcePath = join(process.cwd(), 'data-sources', 'elevation-raw.json');
+  const sourceRaw = await readFile(sourcePath, 'utf8');
+  const realSource = JSON.parse(sourceRaw);
+  ok(await sha256Hex(sourceRaw) === RAW_BASELINE_SHA256 && realRuntime.sourceSha256 === RAW_BASELINE_SHA256,
+    'the runtime identifies the preserved complete raw source by hash');
+  ok(validateCheckpoint(realSource, desc, rHash).ok && realSource.completed === desc.total &&
+    realRuntime.heightReference === 'absolute' &&
+    JSON.stringify(realRuntime.heights) === JSON.stringify(realSource.elevations),
+  'all 20.216 original absolute heights survive generation exactly');
+  let recoveredEnd = realSource.provenance.recovered.end;
+  assert.equal(recoveredEnd, 16825);
+  for (const batch of realSource.provenance.downloaded) {
+    assert.equal(batch.start, recoveredEnd);
+    assert.equal(batch.provider, 'open-meteo');
+    assert.ok(batch.end > batch.start && Number.isFinite(Date.parse(batch.fetchedAt)));
+    recoveredEnd = batch.end;
+  }
+  ok(recoveredEnd === desc.total, 'recorded downloads cover only the 3.391 missing points, without gaps or overlap');
+  const rebuildRoot = trackTemp(await mkdtemp(join(tmpdir(), 'test-elevation-rebuild-')));
+  await copy(join(realRoot, ROADS_FILE_NAME), join(rebuildRoot, ROADS_FILE_NAME));
+  ok((await rebuildElevation({ sourcePath, dataRoot: rebuildRoot })).sha256 === realRuntimeHash,
+    'the checked-in runtime can be reproduced byte for byte offline in a temporary directory');
+  const realMap = parseMapData(JSON.parse(await readFile(join(realRoot, ROADS_FILE_NAME), 'utf8')));
+  const realRoutes = createRouteCatalog(new RoadGraph(realMap.roads), realMap);
+  for (const [id, startHeight] of [
+    ['sprint-borgo-stradone', 489.94648],
+    ['sprint-murata-stradone', 552.22219],
+    ['sprint-fiorentino-stradone', 470.71478],
+    ['dogana-stradone-superstrada', 92.86311]
+  ]) {
+    const route = realRoutes.find((candidate) => candidate.id === id);
+    assert.ok(route, id + ' exists');
+    ok(Math.abs(terrainMeshHeightAt(realRuntime, ...route.path[0]) - startHeight) < 0.01 &&
+      Math.abs(terrainMeshHeightAt(realRuntime, ...route.path.at(-1)) - 656.96640) < 0.01,
+    id + ' preserves the original absolute start and Stradone finish heights');
+  }
 
   console.log('== legacy baseline fixture (offline) ==');
   const legacyValues = JSON.parse(await readFile(LEGACY_FIXTURE_URL, 'utf8'));
@@ -289,6 +356,25 @@ try {
   const tinyInfo = await roadsDescriptor(tinyRoot);
   const tDesc = tinyInfo.descriptor;
   const tHash = tinyInfo.roadsSha256;
+  const rawSourcePath = join(tinyRoot, 'source.json');
+  const completeSource = legacyToCheckpoint(Array.from({ length: tDesc.total }, (_, i) => valueAt(i)), tDesc, tHash).checkpoint;
+  await writeFile(rawSourcePath, JSON.stringify(completeSource));
+  const rebuilt = await rebuildElevation({ sourcePath: rawSourcePath, dataRoot: tinyRoot });
+  const rebuiltRaw = await readFile(rebuilt.outputPath, 'utf8');
+  const rebuiltAsset = JSON.parse(rebuiltRaw);
+  ok(JSON.stringify(rebuiltAsset.heights) === JSON.stringify(completeSource.elevations) &&
+    rebuiltAsset.sourceSha256 === await sha256File(rawSourcePath),
+  'offline rebuild preserves every source height and records its exact source hash');
+  ok((await rebuildElevation({ sourcePath: rawSourcePath, dataRoot: tinyRoot })).sha256 === rebuilt.sha256,
+    'offline regeneration is byte-for-byte deterministic');
+  await writeFile(rawSourcePath, JSON.stringify({ ...completeSource, completed: 2, elevations: [100, 101] }));
+  await assert.rejects(rebuildElevation({ sourcePath: rawSourcePath, dataRoot: tinyRoot }), /incompleta/);
+  await writeFile(rawSourcePath, JSON.stringify({ ...completeSource, roadsSha256: 'b'.repeat(64) }));
+  await assert.rejects(rebuildElevation({ sourcePath: rawSourcePath, dataRoot: tinyRoot }), /roads hash/);
+  ok(await readFile(rebuilt.outputPath, 'utf8') === rebuiltRaw,
+    'incomplete or incompatible raw sources cannot overwrite an existing runtime asset');
+  // The downloader fixture must start without the independently rebuilt asset.
+  await rm(rebuilt.outputPath);
   const tBatches = Math.ceil(tDesc.total / BATCH);
   const fA = makeFakeProvider();
   const rA = await runDownloader({ dataRoot: tinyRoot, provider: fA.provider, sleep: noopSleep });
@@ -392,6 +478,12 @@ try {
   ok(rF.code === 0, 'compatible output exits 0');
   ok(fF.calls.length === 0, 'zero provider requests when the output is already valid');
   ok(await sha256File(join(okRoot, RUNTIME_FILE_NAME)) === okHashBefore, 'existing output left untouched');
+  const forcedCompatible = makeFakeProvider();
+  const forcedCompatibleResult = await runDownloader({
+    dataRoot: okRoot, provider: forcedCompatible.provider, force: true, sleep: noopSleep
+  });
+  ok(forcedCompatibleResult.code === 0 && forcedCompatible.calls.length === tBatches,
+    '--force really regenerates a structurally valid but outdated elevation asset');
 
   console.log('== downloader: incompatible output ==');
   const badRoot = await makeTinyDataRoot();

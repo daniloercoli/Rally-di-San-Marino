@@ -1,6 +1,9 @@
+import { WEATHER_PRESETS } from '../../shared/weather.js';
+
 const ROUTE_ID_RE = /^[a-z0-9-]{1,64}$/;
 const COLOR_RE = /^#[0-9a-f]{6}$/;
 const PHASES = new Set(['waiting', 'countdown', 'running', 'results']);
+const WEATHER_IDS = new Set(WEATHER_PRESETS.map((preset) => preset.id));
 
 function boundedText(value) {
   return typeof value === 'string' ? value.trim().slice(0, 80) : '';
@@ -15,6 +18,7 @@ export function normalizeRouteLobby(payload) {
     const id = typeof candidate.id === 'string' && ROUTE_ID_RE.test(candidate.id) ? candidate.id : '';
     const start = boundedText(candidate.start);
     const end = boundedText(candidate.end);
+    const label = boundedText(candidate.label);
     const lengthKm = typeof candidate.lengthKm === 'number' && Number.isFinite(candidate.lengthKm)
       ? Math.max(0, Math.min(candidate.lengthKm, 1000))
       : 0;
@@ -23,11 +27,25 @@ export function normalizeRouteLobby(payload) {
       : 2;
     if (!id || !start || !end || seen.has(id)) continue;
     seen.add(id);
-    options.push({ id, start, end, lengthKm, checkpoints });
+    options.push({ id, label, start, end, lengthKm, checkpoints });
   }
   const selectedRouteId = typeof source.selectedRouteId === 'string' && seen.has(source.selectedRouteId)
     ? source.selectedRouteId
     : options[0]?.id || '';
+  const weatherOptions = [];
+  const seenWeather = new Set();
+  for (const candidate of Array.isArray(source.weatherOptions) ? source.weatherOptions.slice(0, 8) : []) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue;
+    const id = typeof candidate.id === 'string' && WEATHER_IDS.has(candidate.id) ? candidate.id : '';
+    const label = boundedText(candidate.label);
+    if (!id || !label || seenWeather.has(id)) continue;
+    seenWeather.add(id);
+    weatherOptions.push({ id, label });
+  }
+  const selectedWeatherId = typeof source.selectedWeatherId === 'string' &&
+    seenWeather.has(source.selectedWeatherId)
+    ? source.selectedWeatherId
+    : weatherOptions[0]?.id || '';
   const players = [];
   const playerIds = new Set();
   for (const candidate of Array.isArray(source.players) ? source.players.slice(0, 4) : []) {
@@ -54,6 +72,8 @@ export function normalizeRouteLobby(payload) {
   return {
     options,
     selectedRouteId,
+    weatherOptions,
+    selectedWeatherId,
     locked: source.locked === true,
     phase,
     capacity,
@@ -74,6 +94,7 @@ export function lobbyView(lobby, playerId) {
     ready: participant?.ready === true,
     allReady,
     canChangeRoute: waiting && (lobby?.hostId === null || isHost) && lobby?.locked !== true,
+    canChangeWeather: waiting && (lobby?.hostId === null || isHost) && lobby?.locked !== true,
     canStart: waiting && isHost && allReady
   };
 }

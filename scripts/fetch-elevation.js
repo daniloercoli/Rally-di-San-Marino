@@ -198,7 +198,7 @@ export async function runDownloader(options) {
     const check = existing.parseError
       ? { ok: false, reason: 'file is not valid JSON' }
       : validateRuntimeAsset(existing.data, descriptor, roadsSha256);
-    if (check.ok) {
+    if (check.ok && !force) {
       return { code: 0, reason: 'existing elevation.json is compatible; nothing to do', completed: total, total };
     }
     if (!force) {

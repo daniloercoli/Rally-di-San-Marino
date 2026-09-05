@@ -4,9 +4,9 @@ export { SURFACE } from './geometry.js';
 
 export const PHYSICS = {
   onRoad: {
-    maxSpeed: 250 / 3.6,
+    maxSpeed: 200 / 3.6,
     reverseMax: 6,
-    accel: 13,
+    accel: 12.5,
     brake: 24,
     handbrake: 9,
     handbrakeSteer: 1.75,
@@ -15,9 +15,9 @@ export const PHYSICS = {
     steer: 1.65
   },
   shoulder: {
-    maxSpeed: 250 / 3.6,
+    maxSpeed: 200 / 3.6,
     reverseMax: 6,
-    accel: 13,
+    accel: 12.5,
     brake: 24,
     handbrake: 9,
     handbrakeSteer: 1.75,
@@ -35,6 +35,28 @@ export const PHYSICS = {
     coast: 0.18,
     overspeedDecel: 9,
     steer: 1.25
+  },
+  gravel: {
+    maxSpeed: 95 / 3.6,
+    reverseMax: 3.8,
+    accel: 6.1,
+    brake: 15,
+    handbrake: 5.8,
+    handbrakeSteer: 1.5,
+    coast: 0.2,
+    overspeedDecel: 8,
+    steer: 1.05
+  },
+  mud: {
+    maxSpeed: 65 / 3.6,
+    reverseMax: 3,
+    accel: 4.5,
+    brake: 11,
+    handbrake: 4.5,
+    handbrakeSteer: 1.25,
+    coast: 0.24,
+    overspeedDecel: 6,
+    steer: 0.78
   },
   offRoad: {
     maxSpeed: 50 / 3.6,
@@ -57,7 +79,7 @@ export const DRIVETRAIN = Object.freeze({
     Object.freeze({ min: 0, max: 20 }),
     Object.freeze({ min: 11, max: 34 }),
     Object.freeze({ min: 23, max: 48 }),
-    Object.freeze({ min: 35, max: 60 }),
+    Object.freeze({ min: 35, max: 52 }),
     Object.freeze({ min: 46, max: 72 })
   ])
 });
@@ -126,11 +148,97 @@ export function driveForceMultiplier(rpm) {
   return 0.72 + Math.sin(normalized * Math.PI) * 0.38;
 }
 
+export function isLooseSurface(surface) {
+  return surface === SURFACE.TRACK || surface === SURFACE.GRAVEL || surface === SURFACE.MUD;
+}
+
+const LOOSE_SURFACE_MOTION = Object.freeze({
+  [SURFACE.TRACK]: Object.freeze({ phaseRate: 1.35, lateralSpeed: 0.1, yawRate: 0.004 }),
+  [SURFACE.GRAVEL]: Object.freeze({ phaseRate: 1.55, lateralSpeed: 0.16, yawRate: 0.006 }),
+  [SURFACE.MUD]: Object.freeze({ phaseRate: 1.25, lateralSpeed: 0.18, yawRate: 0.006 })
+});
+const LOOSE_MOTION_MIN_SPEED = 8 / 3.6;
+const FULL_TURN = Math.PI * 2;
+
+function seededSurfacePhase(id) {
+  const value = String(id ?? '').slice(0, 64);
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index++) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return ((hash >>> 0) / 0xffffffff) * FULL_TURN;
+}
+
+function normalizedSurfacePhase(value, id) {
+  if (!Number.isFinite(value)) return seededSurfacePhase(id);
+  if (value >= 0 && value < FULL_TURN) return value;
+  return ((value % FULL_TURN) + FULL_TURN) % FULL_TURN;
+}
+
+export function looseSurfaceMotion(surface, speed, phase = 0) {
+  const profile = LOOSE_SURFACE_MOTION[surface];
+  const velocity = typeof speed === 'number' && Number.isFinite(speed) ? Math.abs(speed) : 0;
+  const safePhase = Number.isFinite(phase) ? phase : 0;
+  if (!profile || velocity <= LOOSE_MOTION_MIN_SPEED) {
+    return { phaseRate: 0, lateralSpeed: 0, yawRate: 0 };
+  }
+  const physics = physicsForSurface(surface);
+  const intensity = clamp(
+    (velocity - LOOSE_MOTION_MIN_SPEED) / Math.max(1, physics.maxSpeed * 0.7 - LOOSE_MOTION_MIN_SPEED),
+    0,
+    1
+  );
+  const lateralWave = Math.sin(safePhase) + Math.sin(safePhase * 2 + 0.8) * 0.28;
+  const yawWave = Math.sin(safePhase + 1.1) + Math.sin(safePhase * 2 + 2.4) * 0.22;
+  return {
+    phaseRate: profile.phaseRate * (0.85 + intensity * 0.3),
+    lateralSpeed: profile.lateralSpeed * intensity * lateralWave,
+    yawRate: profile.yawRate * intensity * yawWave
+  };
+}
+
+function normalizeCarSurface(car) {
+  const surface = car?.surface;
+  if (surface === SURFACE.SHOULDER || isLooseSurface(surface) || surface === SURFACE.GRASS) {
+    return surface;
+  }
+  if (surface === SURFACE.ASPHALT && car?.onRoad !== false) return surface;
+  return car?.onRoad === false ? SURFACE.GRASS : SURFACE.ASPHALT;
+}
+
+function physicsForSurface(surface) {
+  if (surface === SURFACE.TRACK) return PHYSICS.track;
+  if (surface === SURFACE.GRAVEL) return PHYSICS.gravel;
+  if (surface === SURFACE.MUD) return PHYSICS.mud;
+  if (surface === SURFACE.GRASS) return PHYSICS.offRoad;
+  return surface === SURFACE.SHOULDER ? PHYSICS.shoulder : PHYSICS.onRoad;
+}
+
+const PAVED_TAPER_START = 100 / 3.6;
+const PAVED_TAPER_STRENGTH = 0.78;
+
+export function forwardSpeedResponse(speed, maxSpeed, paved = false) {
+  const velocity = typeof speed === 'number' && Number.isFinite(speed) ? Math.max(0, speed) : 0;
+  const limit = typeof maxSpeed === 'number' && Number.isFinite(maxSpeed) && maxSpeed > 0
+    ? maxSpeed
+    : PHYSICS.onRoad.maxSpeed;
+  const responseMaxSpeed = paved ? 215 / 3.6 : limit;
+  const baseResponse = Math.max(0.12, 1 - Math.pow(velocity / responseMaxSpeed, 2));
+  if (!paved || velocity <= PAVED_TAPER_START || limit <= PAVED_TAPER_START) {
+    return baseResponse;
+  }
+  const highSpeedProgress = clamp(
+    (velocity - PAVED_TAPER_START) / (limit - PAVED_TAPER_START),
+    0,
+    1
+  );
+  const highSpeedTaper = 1 - PAVED_TAPER_STRENGTH * Math.pow(highSpeedProgress, 1.5);
+  return Math.max(0.025, baseResponse * highSpeedTaper);
+}
+
 export function syncDrivetrain(car, driveInput = 0) {
-  car.surface = car.surface === SURFACE.SHOULDER || car.surface === SURFACE.TRACK ||
-    car.surface === SURFACE.GRASS
-    ? car.surface
-    : car.onRoad === false ? SURFACE.GRASS : SURFACE.ASPHALT;
+  car.surface = normalizeCarSurface(car);
   car.gear = automaticGear(car.speed, car.gear, driveInput);
   car.rpm = rpmForSpeed(car.speed, car.gear);
   car.brakeLevel = clamp(Number.isFinite(car.brakeLevel) ? car.brakeLevel : 0, 0, 1);
@@ -152,6 +260,7 @@ export function createCar(id, x, z, yaw, color, name) {
     brakeLevel: 0,
     handbrake: false,
     surface: SURFACE.ASPHALT,
+    surfaceDriftPhase: seededSurfacePhase(id),
     impactSeq: 0,
     impactLevel: 0,
     onRoad: true,
@@ -166,15 +275,8 @@ export function createCar(id, x, z, yaw, color, name) {
 // roadIndex: RoadIndex (shared/geometry.js)
 // directionLock: initial motion sign while braking across server substeps (-1, 0, 1)
 export function stepCar(car, input, roadIndex, dt, directionLock = 0) {
-  const surface = car.surface === SURFACE.SHOULDER || car.surface === SURFACE.TRACK ||
-    car.surface === SURFACE.GRASS
-    ? car.surface
-    : car.onRoad === false ? SURFACE.GRASS : SURFACE.ASPHALT;
-  const p = surface === SURFACE.TRACK
-    ? PHYSICS.track
-    : surface === SURFACE.GRASS
-      ? PHYSICS.offRoad
-      : surface === SURFACE.SHOULDER ? PHYSICS.shoulder : PHYSICS.onRoad;
+  const surface = normalizeCarSurface(car);
+  const p = physicsForSurface(surface);
   const pavedSurface = surface === SURFACE.ASPHALT || surface === SURFACE.SHOULDER;
   const u = finiteInput(input?.u);
   const a = finiteInput(input?.a);
@@ -203,12 +305,7 @@ export function stepCar(car, input, roadIndex, dt, directionLock = 0) {
     } else {
       car.gear = automaticGear(car.speed, car.gear, driveInput);
       car.rpm = rpmForSpeed(car.speed, car.gear);
-      const highSpeedProgress = pavedSurface
-        ? clamp((car.speed - 200 / 3.6) / (p.maxSpeed - 200 / 3.6), 0, 1)
-        : 0;
-      const highSpeedTaper = 1 - highSpeedProgress * 0.96;
-      const responseMaxSpeed = pavedSurface ? 225 / 3.6 : p.maxSpeed;
-      const speedFactor = Math.max(0.12, 1 - Math.pow(car.speed / responseMaxSpeed, 2)) * highSpeedTaper;
+      const speedFactor = forwardSpeedResponse(car.speed, p.maxSpeed, pavedSurface);
       car.speed = Math.min(
         p.maxSpeed,
         car.speed + p.accel * driveForceMultiplier(car.rpm) * speedFactor * driveInput * step
@@ -259,8 +356,20 @@ export function stepCar(car, input, roadIndex, dt, directionLock = 0) {
   const direction = car.speed >= 0 ? 1 : -1;
   car.yaw += a * p.steer * lowSpeedResponse * highSpeedResponse * handbrakeResponse * direction * step;
 
+  const currentDriftPhase = normalizedSurfacePhase(car.surfaceDriftPhase, car.id);
+  const phaseMotion = looseSurfaceMotion(surface, car.speed, currentDriftPhase);
+  const driftPhase = currentDriftPhase + phaseMotion.phaseRate * step * 0.5;
+  const driftMotion = looseSurfaceMotion(surface, car.speed, driftPhase);
+  car.surfaceDriftPhase = normalizedSurfacePhase(
+    currentDriftPhase + phaseMotion.phaseRate * step,
+    car.id
+  );
+  car.yaw += driftMotion.yawRate * step;
+
   car.x += Math.sin(car.yaw) * car.speed * step;
   car.z -= Math.cos(car.yaw) * car.speed * step;
+  car.x += Math.cos(car.yaw) * driftMotion.lateralSpeed * step;
+  car.z += Math.sin(car.yaw) * driftMotion.lateralSpeed * step;
 
   const q = roadIndex.query(car.x, car.z);
   car.onRoad = q.onRoad;

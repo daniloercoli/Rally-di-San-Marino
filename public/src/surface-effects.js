@@ -1,11 +1,11 @@
-import { PHYSICS, SURFACE } from '../../shared/physics.js';
+import { PHYSICS, isLooseSurface } from '../../shared/physics.js';
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
 export function surfaceShake(surface, speed, timeSeconds, seed = 0) {
-  if (surface !== SURFACE.TRACK) return { y: 0, pitch: 0, roll: 0 };
+  if (!isLooseSurface(surface)) return { y: 0, pitch: 0, roll: 0 };
   const velocity = Number.isFinite(speed) ? Math.abs(speed) : 0;
   const time = Number.isFinite(timeSeconds) ? timeSeconds : 0;
   const phaseSeed = Number.isFinite(seed) ? seed * 0.73 : 0;

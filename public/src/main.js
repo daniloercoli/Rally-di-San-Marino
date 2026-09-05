@@ -3,6 +3,7 @@ import { parseMapData } from 'shared/mapdata.js';
 import { fitBuildingFootprintsToRoads, projectBuildingFootprints } from 'shared/buildings.js';
 import { RoadIndex } from 'shared/geometry.js';
 import { createRoutePaceNotes } from 'shared/route.js';
+import { DEFAULT_WEATHER_ID, normalizeWeatherId } from 'shared/weather.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import {
   engineTargets,
@@ -16,6 +17,7 @@ import { INITIAL_JOIN_STATE, joinView, transitionJoin } from './join-state.js';
 import { readDrivingInput, shouldPreventDrivingKey } from './input-state.js';
 import { createCarModel } from './car-model.js';
 import { createRoadGeometryBatches } from './road-geometry.js';
+import { createRoadSurface } from './road-surface.js';
 import {
   buildingGray,
   buildingPlacement,
@@ -58,16 +60,15 @@ import {
   CAMERA_SURFACE_CLEARANCE,
   CAR_SURFACE_CLEARANCE,
   RENDER_ELEVATION_SCALE,
-  clampHeightAboveTerrain,
   createTerrainPositions,
   mergeWorldGeometries,
   readJsonResponse,
-  surfaceHeightWithClearance,
   terrainBackdropHeight,
   terrainMeshHeightAt,
   validateTerrainData
 } from './world-data.js';
-import { WORLD_HORIZON_COLOR, worldViewForBounds } from './world-view.js';
+import { worldViewForBounds } from './world-view.js';
+import { weatherViewForWorld } from './weather-view.js';
 import { io } from 'socket.io-client';
 
 const $ = (id) => document.getElementById(id);
@@ -91,6 +92,8 @@ const playerNameEl = $('player-name');
 const playerColorEl = $('player-color');
 const routeSelectEl = $('route-select');
 const routeHintEl = $('route-hint');
+const weatherSelectEl = $('weather-select');
+const weatherHintEl = $('weather-hint');
 const lobbyControlsEl = $('lobby-controls');
 const lobbyPlayersEl = $('lobby-players');
 const readyBtn = $('ready-btn');
@@ -109,15 +112,17 @@ let mmScale = 1, mmOx = 0, mmOy = 0;
 let routePath = null;
 let routeDashes = null, startRing = null, finishRing = null;
 let routePathKey = '';
+let routeSurface = null;
 let routeSigns = null, routeSignsKey = '';
 let pbMs = Number(localStorage.getItem('rally-pb')) || null;
 let terrainData = null;
+let roadSurface = null;
 let audioCtx = null, engineOsc = null, engineGain = null;
 let brakeNoise = null, brakeFilter = null, brakeGainNode = null;
 let surfaceNoise = null, surfaceFilter = null, surfaceGainNode = null;
 let impactNoiseBuffer = null;
 
-let renderer, scene, camera, cpRing;
+let renderer, scene, camera, cpRing, hemisphereLight, directionalLight;
 let updateQaMetrics = () => {};
 const carMeshes = new Map();
 const snapshots = new Map();
@@ -133,6 +138,8 @@ let phase = 'waiting';
 let round = 0;
 let joinState = INITIAL_JOIN_STATE;
 let routeLobby = normalizeRouteLobby(null);
+let baseWorldView = worldViewForBounds(null);
+let weatherId = DEFAULT_WEATHER_ID;
 let streetBannerState = createStreetBannerState();
 let turnCueState = createTurnCueState();
 let renderedStartSignal = null;
@@ -324,6 +331,8 @@ function renderJoinState() {
 
   const canChooseRoute = lobby.canChangeRoute && routeLobby.options.length >= 2;
   routeSelectEl.disabled = !canChooseRoute;
+  const canChooseWeather = lobby.canChangeWeather && routeLobby.weatherOptions.length >= 2;
+  weatherSelectEl.disabled = !canChooseWeather;
   if (routeLobby.hostId === null) {
     routeHintEl.textContent = 'Il primo giocatore collegato sarà l’host e sceglierà il tracciato.';
   } else if (lobby.isHost && routeLobby.phase === 'waiting') {
@@ -332,6 +341,15 @@ function renderJoinState() {
     routeHintEl.textContent = 'Tracciato bloccato per la manche in corso.';
   } else {
     routeHintEl.textContent = 'Tracciato scelto dall’host.';
+  }
+  if (routeLobby.hostId === null) {
+    weatherHintEl.textContent = 'Il primo giocatore sceglierà anche il meteo.';
+  } else if (lobby.isHost && routeLobby.phase === 'waiting') {
+    weatherHintEl.textContent = 'Sei l’host: il meteo è condiviso con tutti i piloti.';
+  } else if (routeLobby.locked) {
+    weatherHintEl.textContent = 'Meteo bloccato per la manche in corso.';
+  } else {
+    weatherHintEl.textContent = 'Meteo scelto dall’host.';
   }
 
   const playersFragment = document.createDocumentFragment();
@@ -415,12 +433,14 @@ socket.on('connect', () => updateJoinState({ type: 'connected' }));
 
 socket.on('lobby', (payload) => {
   const previousChoice = routeSelectEl.value;
+  const previousWeatherChoice = weatherSelectEl.value;
   routeLobby = normalizeRouteLobby(payload);
   const fragment = document.createDocumentFragment();
   for (const option of routeLobby.options) {
     const element = document.createElement('option');
     element.value = option.id;
-    element.textContent = `${option.start} → ${option.end} · ${option.lengthKm.toFixed(1)} km`;
+    const prefix = option.label ? `${option.label} · ` : '';
+    element.textContent = `${prefix}${option.start} → ${option.end} · ${option.lengthKm.toFixed(1)} km`;
     fragment.append(element);
   }
   routeSelectEl.replaceChildren(fragment);
@@ -428,6 +448,19 @@ socket.on('lobby', (payload) => {
     ? previousChoice
     : routeLobby.selectedRouteId;
   if (preferred) routeSelectEl.value = preferred;
+  const weatherFragment = document.createDocumentFragment();
+  for (const option of routeLobby.weatherOptions) {
+    const element = document.createElement('option');
+    element.value = option.id;
+    element.textContent = option.label;
+    weatherFragment.append(element);
+  }
+  weatherSelectEl.replaceChildren(weatherFragment);
+  const keepUnjoinedWeather = me === null && routeLobby.hostId === null &&
+    routeLobby.weatherOptions.some((option) => option.id === previousWeatherChoice);
+  const preferredWeather = keepUnjoinedWeather ? previousWeatherChoice : routeLobby.selectedWeatherId;
+  if (preferredWeather) weatherSelectEl.value = preferredWeather;
+  applyWeather(preferredWeather);
   renderJoinState();
 });
 
@@ -460,6 +493,7 @@ socket.on('init', (d) => {
   if (typeof d.routeId === 'string' && routeLobby.options.some((option) => option.id === d.routeId)) {
     routeSelectEl.value = d.routeId;
   }
+  applyWeather(d.weatherId);
   renderJoinState();
   renderStartSignal(d);
   buildRouteOverlay();
@@ -473,6 +507,7 @@ socket.on('full', () => {
 socket.on('race_started', () => updateJoinState({ type: 'race_started' }));
 
 socket.on('state', (s) => {
+  if (typeof s.weatherId === 'string' && s.weatherId !== weatherId) applyWeather(s.weatherId);
   running = s.running;
   phase = s.phase || (s.running ? 'running' : 'countdown');
   if (typeof s.round === 'number' && s.round !== round) {
@@ -539,26 +574,46 @@ function initThree() {
   renderer.setSize(window.innerWidth, window.innerHeight);
   app.appendChild(renderer.domElement);
   scene = new THREE.Scene();
-  const initialView = worldViewForBounds(null);
-  scene.background = new THREE.Color(WORLD_HORIZON_COLOR);
-  scene.fog = new THREE.Fog(WORLD_HORIZON_COLOR, initialView.fogNear, initialView.fogFar);
+  scene.background = new THREE.Color();
+  scene.fog = new THREE.Fog(0, baseWorldView.fogNear, baseWorldView.fogFar);
   camera = new THREE.PerspectiveCamera(
     62,
     window.innerWidth / window.innerHeight,
     0.1,
-    initialView.cameraFar
+    baseWorldView.cameraFar
   );
   camera.position.set(0, 8, -20);
-  scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x2a3a2a, 1.0));
-  const dl = new THREE.DirectionalLight(0xffffff, 1.4);
-  dl.position.set(200, 400, -100);
-  scene.add(dl);
+  hemisphereLight = new THREE.HemisphereLight();
+  scene.add(hemisphereLight);
+  directionalLight = new THREE.DirectionalLight();
+  directionalLight.position.set(200, 400, -100);
+  scene.add(directionalLight);
+  applyWeather(weatherId);
   updateQaMetrics = installQaMetrics(document, renderer, scene);
   window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
   });
+}
+
+function applyWeather(value) {
+  weatherId = normalizeWeatherId(value);
+  const view = weatherViewForWorld(weatherId, baseWorldView);
+  document.documentElement.dataset.weather = weatherId;
+  if (!scene || !camera || !hemisphereLight || !directionalLight) return view;
+  scene.background.set(view.skyColor);
+  scene.fog.color.set(view.skyColor);
+  scene.fog.near = view.fogNear;
+  scene.fog.far = view.fogFar;
+  camera.far = view.cameraFar;
+  camera.updateProjectionMatrix();
+  hemisphereLight.color.set(view.hemisphereSkyColor);
+  hemisphereLight.groundColor.set(view.hemisphereGroundColor);
+  hemisphereLight.intensity = view.hemisphereIntensity;
+  directionalLight.color.set(view.directionalColor);
+  directionalLight.intensity = view.directionalIntensity;
+  return view;
 }
 
 function makeAsphaltTexture() {
@@ -605,13 +660,11 @@ async function loadMap() {
   const { data: raw } = await readJsonResponse(res, 'roads.json');
   const map = parseMapData(raw);
   mapData = map;
-  const view = worldViewForBounds(map.bbox);
-  scene.fog.near = view.fogNear;
-  scene.fog.far = view.fogFar;
-  camera.far = view.cameraFar;
-  camera.updateProjectionMatrix();
-  console.log('[world] horizon fog ' + view.fogNear + '-' + view.fogFar +
-    ' m, camera ' + view.cameraFar + ' m');
+  roadSurface = createRoadSurface(map.roads, terrainHeight);
+  baseWorldView = worldViewForBounds(map.bbox);
+  const view = applyWeather(weatherId);
+  console.log('[world] meteo ' + weatherId + ', foschia ' + Math.round(view.fogNear) + '-' +
+    Math.round(view.fogFar) + ' m, camera ' + Math.round(view.cameraFar) + ' m');
   const cx = (map.bbox.minX + map.bbox.maxX) / 2;
   const cz = (map.bbox.minZ + map.bbox.maxZ) / 2;
   const w = map.bbox.maxX - map.bbox.minX;
@@ -625,21 +678,22 @@ async function loadMap() {
   scene.add(ground);
   const asphalt = makeAsphaltTexture();
   const roadBatches = createRoadGeometryBatches(map.roads, {
-    heightAt: terrainHeight,
+    heightAt: roadHeight,
+    heightAtForRoad: roadSurface.heightAtForRoad,
+    pointsForRoad: roadSurface.pointsForRoad,
     verticalScale: RENDER_ELEVATION_SCALE
   });
+  roadSurface.releaseGeometryData();
+  const roadMaterial = new THREE.MeshBasicMaterial({
+    map: asphalt,
+    vertexColors: true,
+    side: THREE.DoubleSide
+  });
   if (roadBatches.shoulderGeometry) {
-    scene.add(new THREE.Mesh(roadBatches.shoulderGeometry, new THREE.MeshBasicMaterial({
-      vertexColors: true,
-      side: THREE.DoubleSide
-    })));
+    scene.add(new THREE.Mesh(roadBatches.shoulderGeometry, roadMaterial));
   }
   if (roadBatches.roadGeometry) {
-    scene.add(new THREE.Mesh(roadBatches.roadGeometry, new THREE.MeshBasicMaterial({
-      map: asphalt,
-      vertexColors: true,
-      side: THREE.DoubleSide
-    })));
+    scene.add(new THREE.Mesh(roadBatches.roadGeometry, roadMaterial));
   }
   if (roadBatches.dashGeometry) {
     scene.add(new THREE.Mesh(roadBatches.dashGeometry, new THREE.MeshBasicMaterial({
@@ -666,6 +720,9 @@ async function loadMap() {
 // ===== world (terrain + buildings) =====
 function terrainHeight(x, z) {
   return terrainMeshHeightAt(terrainData, x, z);
+}
+function roadHeight(x, z) {
+  return roadSurface ? roadSurface.heightAt(x, z) : terrainHeight(x, z);
 }
 function buildTerrain(td) {
   const cols = td.cols, rows = td.rows, cell = td.cell;
@@ -805,8 +862,12 @@ function buildRouteOverlay() {
   routeDashes = null;
   startRing = null;
   finishRing = null;
+  routeSurface = null;
   routePathKey = nextKey;
-  const geometries = createRouteOverlayGeometries(sourcePoints, { heightAt: terrainHeight });
+  routeSurface = roadSurface?.profilePath(sourcePoints) || null;
+  const guidePoints = routeSurface?.points || sourcePoints;
+  const routeHeight = routeSurface?.heightAt || roadHeight;
+  const geometries = createRouteOverlayGeometries(guidePoints, { heightAt: routeHeight });
   if (!geometries) return;
   const { points: pts, ribbonGeometry, dashGeometry } = geometries;
   routePath = new THREE.Mesh(ribbonGeometry, new THREE.MeshBasicMaterial({
@@ -824,13 +885,13 @@ function buildRouteOverlay() {
   const mkRing = (r, col) => new THREE.Mesh(new THREE.RingGeometry(r - 0.7, r, 40), new THREE.MeshBasicMaterial({ color: col, side: THREE.DoubleSide }));
   startRing = mkRing(4, 0x42ff6e);
   startRing.rotation.x = -Math.PI / 2;
-  startRing.position.set(pts[0].x, terrainHeight(pts[0].x, pts[0].z) + 0.12, pts[0].z);
+  startRing.position.set(pts[0].x, routeHeight(pts[0].x, pts[0].z) + 0.12, pts[0].z);
   scene.add(startRing);
   finishRing = mkRing(5, 0xff5555);
   finishRing.rotation.x = -Math.PI / 2;
   finishRing.position.set(
     pts[pts.length - 1].x,
-    terrainHeight(pts[pts.length - 1].x, pts[pts.length - 1].z) + 0.12,
+    routeHeight(pts[pts.length - 1].x, pts[pts.length - 1].z) + 0.12,
     pts[pts.length - 1].z
   );
   finishRing.visible = false;
@@ -839,7 +900,7 @@ function buildRouteOverlay() {
 
 function buildRouteSigns(force = false) {
   if (!mapData) return;
-  const key = JSON.stringify(routeDirections);
+  const key = routePathKey + ':' + JSON.stringify(routeDirections);
   if (!force && routeSigns && routeSignsKey === key) return;
   if (routeSigns) {
     disposeObject3D(routeSigns);
@@ -847,7 +908,7 @@ function buildRouteSigns(force = false) {
   }
   routeSignsKey = key;
   if (!routeDirections.length) return;
-  routeSigns = createRouteSignGroup(THREE, routeDirections, terrainHeight);
+  routeSigns = createRouteSignGroup(THREE, routeDirections, routeSurface?.heightAt || roadHeight);
   scene.add(routeSigns);
   console.log('[route] cartelli ' + routeSigns.children.length);
 }
@@ -953,12 +1014,9 @@ function updateCamera(dt) {
   camera.position.x += (tx - camera.position.x) * t;
   camera.position.y += (g.position.y + 6 - camera.position.y) * t;
   camera.position.z += (tz - camera.position.z) * t;
-  camera.position.y = clampHeightAboveTerrain(
-    terrainData,
-    camera.position.x,
-    camera.position.z,
-    camera.position.y,
-    CAMERA_SURFACE_CLEARANCE
+  camera.position.y = Math.max(
+    Number.isFinite(camera.position.y) ? camera.position.y : 0,
+    roadHeight(camera.position.x, camera.position.z) + CAMERA_SURFACE_CLEARANCE
   );
   camera.lookAt(g.position.x, g.position.y + 1, g.position.z);
 }
@@ -972,12 +1030,9 @@ function animate() {
     const g = carMeshes.get(c.id);
     if (!g) continue;
     const firstFrame = c.first;
-    const groundY = surfaceHeightWithClearance(
-      terrainData,
-      c.x,
-      c.z,
-      CAR_SURFACE_CLEARANCE
-    );
+    const pose = { x: c.x, z: c.z, yaw: c.yaw };
+    const carHeight = roadSurface ? roadSurface.heightAtForPose(pose) : terrainHeight;
+    const groundY = carHeight(c.x, c.z) + CAR_SURFACE_CLEARANCE;
     const shake = surfaceShake(c.surface, c.speed, performance.now() / 1000, c.id);
     const targetY = groundY + shake.y;
     if (firstFrame) {
@@ -990,7 +1045,7 @@ function animate() {
       g.position.z += (c.z - g.position.z) * k;
       g.rotation.y = lerpAngle(g.rotation.y, -c.yaw, k);
     }
-    const targetAttitude = vehicleTerrainAttitude(terrainHeight, {
+    const targetAttitude = vehicleTerrainAttitude(carHeight, {
       x: g.position.x,
       z: g.position.z,
       yaw: -g.rotation.y
@@ -1013,7 +1068,8 @@ function animate() {
       const idx = Math.min(meSnap.cp + 1, routePts.length - 1);
       const c = routePts[idx];
       const targets = routeTargetVisibility(meSnap.cp, routePts.length, meSnap.finished);
-      cpRing.position.set(c[0], terrainHeight(c[0], c[1]) + 0.5, c[1]);
+      const checkpointHeight = routeSurface?.heightAt || roadHeight;
+      cpRing.position.set(c[0], checkpointHeight(c[0], c[1]) + 0.5, c[1]);
       cpRing.visible = targets.checkpoint;
       if (finishRing) finishRing.visible = targets.finish;
       cpRing.rotation.z += dt * 2;
@@ -1083,12 +1139,23 @@ joinBtn.addEventListener('click', () => {
   if (updateJoinState({ type: 'click' })) {
     const name = playerNameEl.value.trim() || null;
     const color = playerColorEl.value;
-    socket.emit('join', { name, color, routeId: routeSelectEl.value });
+    socket.emit('join', {
+      name,
+      color,
+      routeId: routeSelectEl.value,
+      weatherId: weatherSelectEl.value
+    });
   }
 });
 routeSelectEl.addEventListener('change', () => {
   if (lobbyView(routeLobby, me).canChangeRoute) {
     socket.emit('lobby:route', { routeId: routeSelectEl.value });
+  }
+});
+weatherSelectEl.addEventListener('change', () => {
+  applyWeather(weatherSelectEl.value);
+  if (lobbyView(routeLobby, me).canChangeWeather) {
+    socket.emit('lobby:weather', { weatherId: weatherSelectEl.value });
   }
 });
 readyBtn.addEventListener('click', () => {

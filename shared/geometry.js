@@ -4,6 +4,8 @@ export const SURFACE = Object.freeze({
   ASPHALT: 'asphalt',
   SHOULDER: 'shoulder',
   TRACK: 'track',
+  GRAVEL: 'gravel',
+  MUD: 'mud',
   GRASS: 'grass'
 });
 
@@ -76,6 +78,12 @@ export class RoadIndex {
           bz,
           halfW: road.width / 2,
           isTrack: road.isTrack,
+          driveSurface: road.driveSurface === SURFACE.ASPHALT ||
+            road.driveSurface === SURFACE.TRACK ||
+            road.driveSurface === SURFACE.GRAVEL ||
+            road.driveSurface === SURFACE.MUD
+            ? road.driveSurface
+            : road.isTrack || road.isUnpaved ? SURFACE.TRACK : SURFACE.ASPHALT,
           streetName: typeof road.name === 'string' ? road.name : null
         };
         this.maxHalfWidth = Math.max(this.maxHalfWidth, seg.halfW);
@@ -100,6 +108,7 @@ export class RoadIndex {
     const cz = Math.floor(z / this.cellSize);
     let best = Infinity;
     let bestIsTrack = false;
+    let bestDriveSurface = SURFACE.ASPHALT;
     let bestNamedDistance = Infinity;
     let streetName = null;
     for (let dx = -1; dx <= 1; dx++) {
@@ -112,6 +121,7 @@ export class RoadIndex {
           if (d < best) {
             best = d;
             bestIsTrack = seg.isTrack;
+            bestDriveSurface = seg.driveSurface;
           }
           if (seg.streetName && d <= 1.0 && centerDistance < bestNamedDistance) {
             bestNamedDistance = centerDistance;
@@ -122,10 +132,8 @@ export class RoadIndex {
     }
     const onRoad = best <= ROAD_DRIVE_TOLERANCE;
     let surface = SURFACE.GRASS;
-    if (bestIsTrack && onRoad) {
-      surface = SURFACE.TRACK;
-    } else if (!bestIsTrack && best <= 0) {
-      surface = SURFACE.ASPHALT;
+    if (best <= 0 || (bestIsTrack && onRoad)) {
+      surface = bestDriveSurface;
     } else if (!bestIsTrack && best <= ROAD_SHOULDER_WIDTH) {
       surface = SURFACE.SHOULDER;
     }

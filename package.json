@@ -15,6 +15,7 @@
     "fetch-buildings": "node scripts/fetch-buildings.js",
     "fetch-elevation": "node scripts/fetch-elevation.js",
     "fetch-elevation:slow": "node scripts/fetch-elevation.js --pause-ms 300000",
+    "rebuild:elevation": "node scripts/rebuild-elevation.js",
     "fetch-world": "npm run fetch-buildings && npm run fetch-elevation",
     "check:syntax": "node scripts/check-syntax.js",
     "test": "npm run test:server && npm run test:elevation && npm run test:world && npm run test:ci && npm run build && npm run test:production",

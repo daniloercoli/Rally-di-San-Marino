@@ -219,97 +219,22 @@ export function gridSamplePoints(map, descriptor) {
   return { lats, lons };
 }
 
-function boxBlur(grid, cols, rows, radius) {
-  const tmp = new Float64Array(grid.length);
-  for (let j = 0; j < rows; j++) {
-    for (let i = 0; i < cols; i++) {
-      let sum = 0, count = 0;
-      for (let k = -radius; k <= radius; k++) {
-        const i2 = i + k;
-        if (i2 >= 0 && i2 < cols) { sum += grid[j * cols + i2]; count++; }
-      }
-      tmp[j * cols + i] = sum / count;
-    }
-  }
-  const out = new Float64Array(grid.length);
-  for (let j = 0; j < rows; j++) {
-    for (let i = 0; i < cols; i++) {
-      let sum = 0, count = 0;
-      for (let k = -radius; k <= radius; k++) {
-        const j2 = j + k;
-        if (j2 >= 0 && j2 < rows) { sum += tmp[j2 * cols + i]; count++; }
-      }
-      out[j * cols + i] = sum / count;
-    }
-  }
-  return out;
-}
-
-export function buildFinalAsset({ elev, map, descriptor, roadsSha256 }) {
-  const { cell, cols, rows, total } = descriptor;
+export function buildFinalAsset({ elev, descriptor, roadsSha256 }) {
+  const check = validateGridDescriptor(descriptor);
+  if (!check.ok) throw new Error('buildFinalAsset: ' + check.reason);
+  const { total } = descriptor;
   if (!elev || elev.length !== total) {
     throw new Error('buildFinalAsset: raw elevations must have length cols * rows');
   }
-  const b = map.bbox;
-  const w = b.maxX - b.minX;
-  const h = b.maxZ - b.minZ;
-  const base = boxBlur(boxBlur(elev, cols, rows, 2), cols, rows, 2);
-  const dc = 10;
-  const gw = Math.floor(w / dc) + 2;
-  const gh = Math.floor(h / dc) + 2;
-  const dist = new Float32Array(gw * gh).fill(1e9);
-  for (const road of map.roads) {
-    for (const p of road.points) {
-      const i = Math.min(gw - 1, Math.max(0, Math.floor((p[0] - b.minX) / dc)));
-      const j = Math.min(gh - 1, Math.max(0, Math.floor((p[1] - b.minZ) / dc)));
-      const idx = j * gw + i;
-      if (dist[idx] > 0) dist[idx] = 0;
-    }
+  const heights = Array.from(elev);
+  if (!heights.every(isFiniteNumber)) {
+    throw new Error('buildFinalAsset: raw elevations must contain only finite numbers');
   }
-  for (let pass = 0; pass < 2; pass++) {
-    const fwd = pass === 0;
-    for (let j = 0; j < gh; j++) {
-      for (let i = 0; i < gw; i++) {
-        const ii = fwd ? i : gw - 1 - i;
-        const jj = fwd ? j : gh - 1 - j;
-        const idx = jj * gw + ii;
-        let d = dist[idx];
-        if (jj > 0) { if (dist[idx - gw] + 1 < d) d = dist[idx - gw] + 1; }
-        if (jj < gh - 1) { if (dist[idx + gw] + 1 < d) d = dist[idx + gw] + 1; }
-        if (ii > 0) { if (dist[idx - 1] + 1 < d) d = dist[idx - 1] + 1; }
-        if (ii < gw - 1) { if (dist[idx + 1] + 1 < d) d = dist[idx + 1] + 1; }
-        if (jj > 0 && ii > 0 && dist[idx - gw - 1] + 1.414 < d) d = dist[idx - gw - 1] + 1.414;
-        if (jj > 0 && ii < gw - 1 && dist[idx - gw + 1] + 1.414 < d) d = dist[idx - gw + 1] + 1.414;
-        if (jj < gh - 1 && ii > 0 && dist[idx + gw - 1] + 1.414 < d) d = dist[idx + gw - 1] + 1.414;
-        if (jj < gh - 1 && ii < gw - 1 && dist[idx + gw + 1] + 1.414 < d) d = dist[idx + gw + 1] + 1.414;
-        dist[idx] = d;
-      }
-    }
-  }
-  const smooth = (a, bb, x) => {
-    const t = Math.min(1, Math.max(0, (x - a) / (bb - a)));
-    return t * t * (3 - 2 * t);
-  };
-  const heights = [];
-  for (let j = 0; j < rows; j++) {
-    for (let i = 0; i < cols; i++) {
-      const x = b.minX + i * cell;
-      const z = b.minZ + j * cell;
-      const di = Math.min(gw - 1, Math.floor((x - b.minX) / dc));
-      const dj = Math.min(gh - 1, Math.floor((z - b.minZ) / dc));
-      const d = dist[dj * gw + di] * dc;
-      const f = smooth(15, 70, d);
-      const rv = elev[j * cols + i];
-      const bv = base[j * cols + i];
-      const rel = Number.isFinite(rv) && Number.isFinite(bv) ? rv - bv : 0;
-      let hh = rel * f;
-      if (hh < -12) hh = -12;
-      if (hh > 500) hh = 500;
-      heights.push(+((hh - 0.3).toFixed(2)));
-    }
-  }
+  // Keep the provider's absolute metres. Road clearance belongs to the renderer,
+  // never to a distance mask or a subtraction baked into the elevation dataset.
   return {
     schemaVersion: ELEVATION_SCHEMA_VERSION,
+    heightReference: 'absolute',
     roadsSha256,
     originX: descriptor.originX,
     originZ: descriptor.originZ,

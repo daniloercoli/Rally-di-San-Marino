@@ -52,9 +52,11 @@ passa solo per caso. Registrare nel TODO l'evidenza minima e l'eventuale limite 
   trasformazioni della scena.
 - `public/src/road-geometry.js`: geometrie stradali e tratteggi aggregate in due batch
   renderizzabili, verificabili anche senza DOM/WebGL.
+- `public/src/road-surface.js`: profilo altimetrico locale delle centerline, vincoli sui
+  raccordi connessi, profilo orientato della rotta e sezioni piane, senza modificare il DEM.
 - `public/src/world-data.js`: validazione JSON world lato browser, interpolazione elevation
   e preparazione sicura delle geometrie senza dipendenze DOM/WebGL.
-- `shared/mapdata.js`: parsing Overpass, classi stradali e proiezione geografica.
+- `shared/mapdata.js`: parsing Overpass, classi, topologia/strutture OSM e proiezione.
 - `shared/geometry.js`: primitive geometriche e indice spaziale delle strade.
 - `shared/physics.js`: fisica arcade, superfici, drivetrain e collisioni fra auto.
 - `shared/route.js`: grafo stradale, A*, resampling e scelta del percorso.
@@ -62,6 +64,8 @@ passa solo per caso. Registrare nel TODO l'evidenza minima e l'eventuale limite 
   sorgente legacy; conversione legacy (logica pura, nessuna I/O).
 - `scripts/elevation-store.js`: hash SHA-256, scrittura atomica (temp+rename) e
   conversione legacy del partial elevation su directory arbitrarie.
+- `scripts/rebuild-elevation.js`: rigenerazione offline delle quote assolute dalla
+  sorgente completa versionata in `data-sources/elevation-raw.json`.
 - `scripts/test-server.js`: suite unit/integration del server.
 - `scripts/test-production.js`: smoke test dell'artefatto production su directory fixture.
 - `scripts/test-elevation.js`: suite offline (zero rete) di griglia, checkpoint e asset
@@ -92,12 +96,21 @@ passa solo per caso. Registrare nel TODO l'evidenza minima e l'eventuale limite 
   `textContent`, proprietà DOM e valori già validati.
 - I checkpoint del percorso sono ordinati; una vettura avanza soltanto raggiungendo il
   checkpoint successivo.
+- `road.points` resta la centerline usata da grafo e fisica; gli eventuali
+  `profilePoints` conservano nodi OSM ravvicinati soltanto per il profilo di rendering e
+  non devono cambiare i tracciati autoritativi.
 
 ### Coordinate e unità
 
 - `x`: asse est/ovest in metri.
 - `z`: asse nord/sud in metri, con latitudine invertita dalla proiezione.
-- `y`: quota del rendering.
+- `y`: quota assoluta del rendering in metri; non sottrarre medie locali né applicare
+  maschere o amplificazioni alle quote del dataset. Le distanze dal suolo sono offset
+  del renderer, non trasformazioni della sorgente elevation.
+- Il piano stradale renderizzato è derivato localmente dal DEM: pendenza longitudinale
+  massima 20%, sezione trasversale piana e raccordo di 12 m. Strada, linea guida, auto,
+  checkpoint e camera devono usare lo stesso campionatore; terreno ed edifici conservano
+  la quota DEM naturale.
 - `yaw = 0` punta verso `-z`; il vettore avanti è
   `(Math.sin(yaw), -Math.cos(yaw))`.
 - Velocità e parametri fisici sono in m/s; l'HUD converte in km/h con `* 3.6`.
@@ -142,6 +155,10 @@ e una pausa di 300.000 ms fra richieste. Sul dataset completo esce 0 senza rete;
 rigenerazione richiede `--force`, resta un'operazione manuale di lunga durata e richiede
 autorizzazione esplicita alla rete. Non fa parte dei quality gate automatici.
 
+`npm run rebuild:elevation` rigenera invece `public/data/elevation.json` senza rete,
+con scrittura atomica, da `data-sources/elevation-raw.json`. Verifica completezza,
+griglia e hash delle strade; conserva le quote esatte e registra l'hash della sorgente.
+
 `npm test` esegue le suite `test:server`, `test:elevation`, `test:world` e `test:ci`, poi
 crea il bundle ed esegue `test:production`; passa quindi anche da un checkout privo di
 `dist/`. `npm run check:syntax` applica `node --check` a tutti i sorgenti JavaScript.
@@ -178,7 +195,8 @@ I seguenti file sono generati, versionati e non devono essere editati o formatta
 
 - `public/data/roads.json` (circa 3,2 MiB);
 - `public/data/buildings.json` (circa 4,2 MiB);
-- `public/data/elevation.json` (grid v1 completo con 20.216 valori).
+- `public/data/elevation.json` (grid v1 completo con 20.216 quote assolute);
+- `data-sources/elevation-raw.json` (sorgente completa e provenienza, non pubblica).
 
 La baseline completata contiene `elevation.json`; `.elevation-checkpoint.json` e
 `.elevation-part.json` devono restare assenti da `public/data/`. Il partial storico con

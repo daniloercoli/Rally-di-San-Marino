@@ -10,6 +10,7 @@ import {
   parseMapData
 } from '../shared/mapdata.js';
 import { ROAD_SHOULDER_WIDTH, RoadIndex } from '../shared/geometry.js';
+import { RoadGraph, createRouteCatalog } from '../shared/route.js';
 import {
   BuildingIndex,
   countRoadBuildingOverlaps,
@@ -44,7 +45,18 @@ import {
   validateTerrainData
 } from '../public/src/world-data.js';
 import { collectBrowserPerformance, collectQaMetrics } from '../public/src/qa-metrics.js';
-import { createRoadGeometryBatches, resolveRoadJunctions } from '../public/src/road-geometry.js';
+import {
+  createRoadGeometryBatches,
+  resolveRoadJunctions,
+  roadRenderColor
+} from '../public/src/road-geometry.js';
+import {
+  ROAD_PROFILE_MAX_GRADE,
+  ROAD_PROFILE_SAMPLE_M,
+  ROAD_TERRAIN_BLEND_M,
+  createRoadSurface
+} from '../public/src/road-surface.js';
+import { createRouteOverlayGeometries } from '../public/src/route-overlay.js';
 import {
   buildingGray,
   buildingHeight,
@@ -85,6 +97,19 @@ function countTerrainPenetrations(geometry, heightAt, epsilon = 1e-5) {
     if (y + epsilon < heightAt(x, z)) penetrations++;
   }
   return penetrations;
+}
+
+function geometryColorKeys(geometry) {
+  const colors = geometry.getAttribute('color');
+  const keys = new Set();
+  for (let index = 0; index < colors.count; index++) {
+    keys.add([
+      colors.getX(index).toFixed(8),
+      colors.getY(index).toFixed(8),
+      colors.getZ(index).toFixed(8)
+    ].join(','));
+  }
+  return keys;
 }
 
 const tempDirs = [];
@@ -212,9 +237,9 @@ try {
   'validation does not modify the real data directory');
   const realMap = parseMapData(JSON.parse(realRoadsBefore));
   const realWorldView = worldViewForBounds(realMap.bbox);
-  ok(realWorldView.fogNear === 2100 && realWorldView.fogFar === 10600 &&
-    realWorldView.cameraFar === 14100,
-  'real map bounds extend the readable fog horizon to 10.6 km and the camera to 14.1 km');
+  ok(realWorldView.fogNear === 3400 && realWorldView.fogFar === 19000 &&
+    realWorldView.cameraFar === 21100,
+  'real map bounds extend the readable fog horizon to 19 km and the camera beyond its diagonal');
   const realUnpaved = realMap.roads.filter((road) => road.isUnpaved);
   const realTracks = realMap.roads.filter((road) => road.cls === 'track');
   const realUnclassified = realMap.roads.filter((road) => road.cls === 'unclassified');
@@ -230,6 +255,12 @@ try {
     realMap.roads.filter((road) => !road.isTrack && road.cls !== 'unclassified')
       .every((road) => (road.color === UNPAVED_ROAD_COLOR) === road.isUnpaved),
   'real surface tags classify exactly 490 unpaved roads without changing unrelated road classes');
+  const realPavedRenderColors = new Set(realMap.roads
+    .filter((road) => !road.isUnpaved)
+    .map(roadRenderColor));
+  ok(realPavedRenderColors.size === 1 &&
+    realUnpaved.every((road) => roadRenderColor(road) === road.color),
+  'all real paved roads share one render colour while every unpaved surface keeps its palette');
   ok(realTracks.length === 489 &&
     realTrackSurfaceCounts['(assente)'] === 441 &&
     realTrackSurfaceCounts.asphalt === 3 &&
@@ -258,8 +289,11 @@ try {
   'all 444 unclassified roads use their surface colour and missing tags remain standard grey');
   const realTerrain = validateTerrainData(JSON.parse(realElevationBefore));
   const realTerrainHeight = (x, z) => terrainMeshHeightAt(realTerrain, x, z);
+  const realRoadSurface = createRoadSurface(realMap.roads, realTerrainHeight, { includeDiagnostics: true });
   const realRoadBatches = createRoadGeometryBatches(realMap.roads, {
-    heightAt: realTerrainHeight,
+    heightAt: realRoadSurface.heightAt,
+    heightAtForRoad: realRoadSurface.heightAtForRoad,
+    pointsForRoad: realRoadSurface.pointsForRoad,
     verticalScale: RENDER_ELEVATION_SCALE
   });
   ok(realRoadBatches.roadSources === 2411 && realRoadBatches.shoulderSources === 1918 &&
@@ -282,9 +316,88 @@ try {
   ok(countTerrainPenetrations(realRoadBatches.roadGeometry, realTerrainHeight) === 0 &&
     countTerrainPenetrations(realRoadBatches.shoulderGeometry, realTerrainHeight) === 0 &&
     countTerrainPenetrations(realRoadBatches.dashGeometry, realTerrainHeight) === 0,
-  'every real road, shoulder and marking triangle centroid stays above the 1.2x terrain mesh');
-  ok(realRoadTriangles + realShoulderTriangles + realDashTriangles <= 250000,
-    'adaptive road draping remains bounded below 250,000 triangles');
+  'every real road, shoulder and marking triangle centroid stays above the 1x terrain mesh');
+  // ELEV-07: the original DEM needed 257,084 triangles. Keep the same three
+  // render batches; current profile timings and the narrow budget are recorded
+  // in the QA report.
+  ok(realRoadTriangles + realShoulderTriangles + realDashTriangles <= 260000,
+    'profiled road geometry over the absolute DEM remains bounded below 260,000 triangles');
+  ok(realRoadSurface.profile.segments.every((segment) =>
+      Math.abs(segment.by - segment.ay) <=
+      ROAD_PROFILE_MAX_GRADE * Math.hypot(segment.bx - segment.ax, segment.bz - segment.az) + 1e-8),
+  'every profiled road segment in the real map respects the twenty-percent grade limit');
+  let maximumRealCrossSlope = 0;
+  for (const road of realMap.roads) {
+    const profiledRoadPoints = realRoadSurface.pointsForRoad(road);
+    for (let point = 0; point < profiledRoadPoints.length - 1; point++) {
+      const [ax, az] = profiledRoadPoints[point];
+      const [bx, bz] = profiledRoadPoints[point + 1];
+      const length = Math.hypot(bx - ax, bz - az) || 1;
+      const nx = (bz - az) / length;
+      const nz = -(bx - ax) / length;
+      const x = (ax + bx) / 2;
+      const z = (az + bz) / 2;
+      const heightAtRoad = realRoadSurface.heightAtForRoadPose(road, {
+        x,
+        z,
+        yaw: Math.atan2(bx - ax, -(bz - az))
+      });
+      const radius = road.width / 2 + (road.isTrack || road.isUnpaved ? 0 : ROAD_SHOULDER_WIDTH);
+      maximumRealCrossSlope = Math.max(maximumRealCrossSlope, Math.abs(
+        heightAtRoad(x + nx * radius, z + nz * radius) -
+        heightAtRoad(x - nx * radius, z - nz * radius)
+      ));
+    }
+  }
+  ok(maximumRealCrossSlope < 1e-8,
+    'all real road and shoulder cross-sections are level across the DEM');
+  const profiledRoutes = createRouteCatalog(new RoadGraph(realMap.roads), realMap);
+  ok(profiledRoutes.length === 12, 'the real-map elevation gate covers all twelve selectable routes');
+  let maximumRouteGrade = 0;
+  let maximumRouteDeviation = 0;
+  let maximumGuideCrossDifference = 0;
+  for (const route of profiledRoutes) {
+    const routeSurface = realRoadSurface.profilePath(route.path);
+    const repeatedSurface = realRoadSurface.profilePath(route.path);
+    ok(routeSurface && JSON.stringify(routeSurface.points) === JSON.stringify(repeatedSurface?.points) &&
+      routeSurface.points.every((point) => point.length === 3 && point.every(Number.isFinite)),
+    route.id + ' produces one finite and deterministic oriented road profile');
+    const overlay = createRouteOverlayGeometries(routeSurface.points, {
+      heightAt: () => Number.NaN
+    });
+    const guidePositions = overlay.ribbonGeometry.getAttribute('position');
+    for (let vertex = 0; vertex < guidePositions.count; vertex += 6) {
+      maximumGuideCrossDifference = Math.max(maximumGuideCrossDifference,
+        Math.abs(guidePositions.getY(vertex) - guidePositions.getY(vertex + 1)),
+        Math.abs(guidePositions.getY(vertex + 2) - guidePositions.getY(vertex + 4)));
+    }
+    for (let point = 1; point < route.path.length; point++) {
+      const [ax, az] = route.path[point - 1];
+      const [bx, bz] = route.path[point];
+      const length = Math.hypot(bx - ax, bz - az);
+      const samples = Math.max(1, Math.ceil(length / 0.5));
+      let previousHeight = routeSurface.heightAt(ax, az, Math.atan2(bx - ax, -(bz - az)));
+      const yaw = Math.atan2(bx - ax, -(bz - az));
+      for (let sample = 1; sample <= samples; sample++) {
+        const x = ax + (bx - ax) * sample / samples;
+        const z = az + (bz - az) * sample / samples;
+        const height = routeSurface.heightAt(x, z, yaw);
+        maximumRouteGrade = Math.max(maximumRouteGrade,
+          Math.abs(height - previousHeight) / (length / samples));
+        maximumRouteDeviation = Math.max(maximumRouteDeviation,
+          Math.abs(height - realTerrainHeight(x, z)));
+        previousHeight = height;
+      }
+    }
+    overlay.ribbonGeometry.dispose();
+    overlay.dashGeometry.dispose();
+  }
+  ok(maximumRouteGrade <= ROAD_PROFILE_MAX_GRADE + 1e-8,
+    'all twelve route profiles stay within the twenty-percent grade limit at 0.5 metre spacing');
+  ok(maximumGuideCrossDifference < 1e-8,
+    'both guide edges stay on exactly one route plane across all twelve routes');
+  ok(maximumRouteDeviation < 40,
+    'connected overlap constraints keep every selected route profile within forty metres of the coarse DEM');
   realRoadBatches.shoulderGeometry.dispose();
   realRoadBatches.roadGeometry.dispose();
   realRoadBatches.dashGeometry.dispose();
@@ -515,7 +628,7 @@ try {
 
   console.log('== browser world helpers: 2x2 terrain ==');
   const tinyTerrain = makeTinyTerrain();
-  ok(RENDER_ELEVATION_SCALE === 1.2, 'render elevation uses the requested exact 1.2x scale');
+  ok(RENDER_ELEVATION_SCALE === 1, 'render elevation uses the DEM at its natural 1x scale');
   ok(validateTerrainData(tinyTerrain) === tinyTerrain, 'valid 2x2 terrain passes client validation');
   ok(terrainHeightAt(tinyTerrain, 5, 5) === 15, 'terrain interpolation returns the bilinear center');
   ok(terrainHeightAt(tinyTerrain, 0, 0) === 0 && terrainHeightAt(tinyTerrain, 10, 10) === 30,
@@ -525,15 +638,15 @@ try {
   const saddleTerrain = makeTinyTerrain();
   saddleTerrain.heights = [0, 10, 20, 100];
   ok(terrainHeightAt(saddleTerrain, 5, 5) === 32.5 &&
-    terrainMeshHeightAt(saddleTerrain, 5, 5) === 18,
-  'render height scales the terrain triangle by 1.2x while raw bilinear data remains available');
-  ok(terrainMeshHeightAt(saddleTerrain, 7.5, 7.5) === 69,
-    'render height preserves the 1.2x elevation on the second triangle inside a terrain cell');
+    terrainMeshHeightAt(saddleTerrain, 5, 5) === 15,
+  'render height follows the first terrain triangle at 1x while raw bilinear data remains available');
+  ok(terrainMeshHeightAt(saddleTerrain, 7.5, 7.5) === 57.5,
+    'render height preserves the natural elevation on the second triangle inside a terrain cell');
   ok(surfaceHeightWithClearance(saddleTerrain, 5, 5, CAR_SURFACE_CLEARANCE) ===
-    18 + CAR_SURFACE_CLEARANCE,
+    15 + CAR_SURFACE_CLEARANCE,
   'car surface clearance is added above the rendered terrain triangle');
   ok(clampHeightAboveTerrain(saddleTerrain, 7.5, 7.5, 10, CAMERA_SURFACE_CLEARANCE) ===
-    69 + CAMERA_SURFACE_CLEARANCE &&
+    57.5 + CAMERA_SURFACE_CLEARANCE &&
     clampHeightAboveTerrain(saddleTerrain, 7.5, 7.5, 80, CAMERA_SURFACE_CLEARANCE) === 80,
   'camera height is raised above steep terrain but an already safe height is preserved');
   ok(surfaceHeightWithClearance(saddleTerrain, Number.NaN, 0, 0.1, 4) === 4.1 &&
@@ -543,21 +656,145 @@ try {
     'terrain interpolation clamps coordinates outside the grid');
   ok(terrainHeightAt(null, 5, 5) === 0, 'missing elevation uses the flat-world fallback');
 
+  console.log('== browser world helpers: road surface profile ==');
+  const wallTerrainHeight = (x, z) => 100 + z * 2 + Math.max(0, 45 - Math.abs(x - 50) * 4.5);
+  const profileRoad = {
+    cls: 'residential',
+    width: 10,
+    y: 0.05,
+    priority: 4,
+    isTrack: false,
+    isUnpaved: false,
+    points: [[0, 0], [100, 0]]
+  };
+  const wallRoadSurface = createRoadSurface([profileRoad], wallTerrainHeight, { includeDiagnostics: true });
+  const lateralHeights = [-4, 0, 4].map((z) => wallRoadSurface.heightAt(25, z));
+  ok(Math.max(...lateralHeights) - Math.min(...lateralHeights) < 1e-9,
+    'road surface removes DEM cross-slope across the whole carriageway');
+  let maximumProfileGrade = 0;
+  for (let x = 1; x <= 100; x++) {
+    maximumProfileGrade = Math.max(maximumProfileGrade,
+      Math.abs(wallRoadSurface.heightAt(x, 0) - wallRoadSurface.heightAt(x - 1, 0)));
+  }
+  ok(maximumProfileGrade <= 0.2 + 1e-9,
+    'road surface limits a sharp longitudinal DEM ridge to twenty percent');
+  ok(wallRoadSurface.heightAt(50, 80) === wallTerrainHeight(50, 80),
+    'road correction leaves terrain far from the carriageway unchanged');
+  ok(wallRoadSurface.profile.maxGrade === ROAD_PROFILE_MAX_GRADE &&
+    wallRoadSurface.profile.sampleSpacing === ROAD_PROFILE_SAMPLE_M &&
+    wallRoadSurface.profile.blendDistance === ROAD_TERRAIN_BLEND_M &&
+    wallRoadSurface.profile.nodes.every((node) => node.height >= node.sourceHeight),
+  'profile exposes deterministic tuning and never lowers a road below its sampled terrain envelope');
+  const crossingRoad = {
+    ...profileRoad,
+    points: [[100, 0], [100, 100]]
+  };
+  const connectedSurface = createRoadSurface([profileRoad, crossingRoad], (x, z) => x + z / 2);
+  ok(Math.abs(connectedSurface.heightAtForRoad(profileRoad)(100, 0) -
+    connectedSurface.heightAtForRoad(crossingRoad)(100, 0)) < 1e-9,
+  'roads that share an OSM node use one continuous profile height at the junction');
+  const connectedOverlapA = {
+    ...profileRoad,
+    osmId: 10,
+    nodeIds: [100, 101, 102],
+    points: [[-20, 0], [0, 0], [20, 0]]
+  };
+  const connectedOverlapB = {
+    ...profileRoad,
+    osmId: 11,
+    nodeIds: [101, 103],
+    points: [[0, 0], [0, 20]]
+  };
+  const connectedOverlapSurface = createRoadSurface(
+    [connectedOverlapA, connectedOverlapB],
+    (x, z) => z * 2,
+    { includeDiagnostics: true }
+  );
+  const overlapAHeight = connectedOverlapSurface.heightAtForRoad(connectedOverlapA)(0, 4);
+  const overlapBHeight = connectedOverlapSurface.heightAtForRoad(connectedOverlapB)(0, 4);
+  ok(connectedOverlapSurface.profile.overlapConstraintCount > 0 &&
+    Math.abs(overlapAHeight - overlapBHeight) < 1e-9,
+  'connected carriageways use one compatible plane throughout their overlapping junction footprint');
+  const hairpinRoad = {
+    ...profileRoad,
+    isTrack: true,
+    isUnpaved: true,
+    points: [[0, 0], [40, 0], [40, 8], [0, 8]]
+  };
+  const hairpinSurface = createRoadSurface([hairpinRoad], (x, z) => z * 2);
+  const lowerHairpinHeight = hairpinSurface.heightAtForPose({
+    x: 10, z: 0, yaw: Math.PI / 2
+  })(10, 0);
+  const upperHairpinHeight = hairpinSurface.heightAtForPose({
+    x: 10, z: 8, yaw: -Math.PI / 2
+  })(10, 8);
+  ok(Math.abs(lowerHairpinHeight - upperHairpinHeight) < 1e-9,
+    'overlapping branches of one hairpin share one local road plane');
+  const groundCrossing = {
+    ...profileRoad,
+    osmId: 1,
+    nodeIds: [101, 102],
+    layer: 0,
+    bridge: false,
+    tunnel: false,
+    points: [[-20, 0], [20, 0]]
+  };
+  const bridgeCrossing = {
+    ...profileRoad,
+    osmId: 2,
+    nodeIds: [201, 202],
+    layer: 1,
+    bridge: true,
+    tunnel: false,
+    points: [[0, -20], [0, 20]]
+  };
+  const overpassSurface = createRoadSurface(
+    [groundCrossing, bridgeCrossing],
+    (x, z) => z > 10 ? 40 : 0
+  );
+  const groundHeight = overpassSurface.heightAtForPose({
+    x: 0, z: 0, yaw: Math.PI / 2
+  })(0, 0);
+  const bridgeHeight = overpassSurface.heightAtForPose({ x: 0, z: 0, yaw: 0 })(0, 0);
+  ok(bridgeHeight - groundHeight > 20,
+    'crossing roads with distinct OSM nodes and layers keep separate overpass profiles');
+  const groundRouteSurface = overpassSurface.profilePath([[-20, 0], [20, 0]]);
+  const bridgeRouteSurface = overpassSurface.profilePath([[0, -20], [0, 20]]);
+  ok(groundRouteSurface && bridgeRouteSurface &&
+    bridgeRouteSurface.heightAt(0, 0, 0) - groundRouteSurface.heightAt(0, 0, Math.PI / 2) > 20,
+  'oriented route profiles select the travelled overpass level without merging the crossing below');
+  overpassSurface.releaseGeometryData();
+  const retainedRouteSurface = overpassSurface.profilePath([[-20, 0], [20, 0]]);
+  ok(retainedRouteSurface?.points.every((point) => point.every(Number.isFinite)) &&
+    overpassSurface.profilePath([[0, 0], [Number.NaN, 0]]) === null,
+  'route profiling remains available after geometry-only data is released and rejects malformed paths');
+  const poseHeight = wallRoadSurface.heightAtForPose({ x: 25, z: 0, yaw: Math.PI / 2 });
+  const poseAttitude = vehicleTerrainAttitude(poseHeight, { x: 25, z: 0, yaw: Math.PI / 2 });
+  ok(Math.abs(poseAttitude.roll) < 1e-12 &&
+    Math.abs(poseHeight(25, 0) - wallRoadSurface.heightAt(25, 0)) < 1e-9,
+  'one selected road plane keeps vehicle height aligned while eliminating stationary DEM roll');
+  const fallbackRoadSurface = createRoadSurface([profileRoad], () => Number.NaN);
+  ok(fallbackRoadSurface.heightAt(25, 0) === 0 &&
+    fallbackRoadSurface.heightAt(Number.NaN, 0) === 0,
+  'road profile falls back to a finite flat plane when terrain samples are unavailable');
+
   const terrainPositions = createTerrainPositions(tinyTerrain, -0.3);
   ok(terrainPositions.length === 12 && Array.from(terrainPositions).every(Number.isFinite) &&
     Math.abs(terrainPositions[4] - (10 * RENDER_ELEVATION_SCALE - 0.3)) < 1e-5 &&
     Math.abs(terrainPositions[10] - (30 * RENDER_ELEVATION_SCALE - 0.3)) < 1e-5,
-  'terrain vertices apply 1.2x before the independent vertical offset');
+  'terrain vertices retain natural heights before the independent vertical offset');
   const negativeTerrain = makeTinyTerrain();
   negativeTerrain.heights = [-10, 0, 10, 20];
-  ok(terrainBackdropHeight(negativeTerrain) === -18 && terrainBackdropHeight(null) === -6,
-    'the backdrop stays six metres below the scaled terrain minimum and preserves flat fallback');
+  ok(terrainBackdropHeight(negativeTerrain) === -16 && terrainBackdropHeight(null) === -6,
+    'the backdrop stays six metres below the natural terrain minimum and preserves flat fallback');
 
   const compactWorldView = worldViewForBounds({ minX: 0, maxX: 6000, minZ: 0, maxZ: 8000 });
-  ok(compactWorldView.fogNear === 1200 && compactWorldView.fogFar === 6000 &&
-    compactWorldView.cameraFar === 8000,
+  ok(compactWorldView.fogNear === 1900 && compactWorldView.fogFar === 10800 &&
+    compactWorldView.cameraFar === 12000,
   'world horizon derives deterministic finite distances from map bounds');
-  ok(JSON.stringify(worldViewForBounds(null)) === JSON.stringify(DEFAULT_WORLD_VIEW),
+  ok(DEFAULT_WORLD_VIEW.fogNear === 3200 && DEFAULT_WORLD_VIEW.fogFar === 18000 &&
+    DEFAULT_WORLD_VIEW.cameraFar === 20000 &&
+    JSON.stringify(worldViewForBounds(null)) === JSON.stringify(DEFAULT_WORLD_VIEW),
     'missing or malformed map bounds use a deterministic extended horizon fallback');
 
   const flatAttitude = vehicleTerrainAttitude(() => 12, { x: 0, z: 0, yaw: 0 });
@@ -636,10 +873,10 @@ try {
   ok(Math.abs(Math.abs(shoulderPositions.getZ(0)) - (5 + ROAD_SHOULDER_WIDTH)) < 1e-6 &&
     Math.abs(Math.abs(roadPositions.getZ(0)) - 5) < 1e-6,
   'rendered paved shoulder extends exactly 1.5 metres beyond each carriageway edge');
-  ok(shoulderColors.getX(0) < roadColors.getX(0) &&
-    shoulderColors.getY(0) < roadColors.getY(0) &&
-    shoulderColors.getZ(0) < roadColors.getZ(0),
-  'the paved shoulder derives every colour channel from a darker version of its asphalt');
+  ok(shoulderColors.getX(0) === roadColors.getX(0) &&
+    shoulderColors.getY(0) === roadColors.getY(0) &&
+    shoulderColors.getZ(0) === roadColors.getZ(0),
+  'the paved shoulder uses exactly the same colour channels as the road centre');
   shoulderFixture.shoulderGeometry.dispose();
   shoulderFixture.roadGeometry.dispose();
 
@@ -747,6 +984,9 @@ try {
     endpointCapRadius > ROAD_CLASSES.primary.width / 2 &&
     endpointCapRadius < ROAD_CLASSES.primary.width / 2 + 0.1,
   'a winning endpoint uses one rounded major-road cap instead of a rectangular overlapping sheet');
+  ok(geometryColorKeys(endpointJunctionFixture.roadGeometry).size === 1 &&
+    geometryColorKeys(endpointJunctionFixture.shoulderGeometry).size === 1,
+  'paved roads, shoulders and their junction cap use one uniform asphalt colour');
   endpointJunctionFixture.shoulderGeometry.dispose();
   endpointJunctionFixture.roadGeometry.dispose();
 

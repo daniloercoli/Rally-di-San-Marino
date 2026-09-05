@@ -1,4 +1,6 @@
-﻿export const ROAD_CLASSES = {
+﻿import { SURFACE } from './geometry.js';
+
+export const ROAD_CLASSES = {
   // Minimum playable widths. Valid OSM width/lanes tags can widen a road but never make
   // the arcade carriageway narrower than these class defaults. The rendering lift and
   // priority deliberately put major roads above minor roads at shared junctions.
@@ -73,6 +75,9 @@ const UNPAVED_SURFACES = new Set([
   'unpaved'
 ]);
 
+const GRAVEL_SURFACES = new Set(['fine_gravel', 'gravel', 'pebblestone']);
+const MUD_SURFACES = new Set(['clay', 'mud']);
+
 export function normalizeRoadSurface(value) {
   if (typeof value !== 'string') return null;
   const normalized = value.trim().toLowerCase();
@@ -84,6 +89,14 @@ export function roadIsUnpaved(tags) {
   if (PAVED_SURFACES.has(surface)) return false;
   if (UNPAVED_SURFACES.has(surface)) return true;
   return tags?.highway === 'track';
+}
+
+export function roadDriveSurface(tags) {
+  if (!roadIsUnpaved(tags)) return SURFACE.ASPHALT;
+  const surface = normalizeRoadSurface(tags?.surface);
+  if (GRAVEL_SURFACES.has(surface)) return SURFACE.GRAVEL;
+  if (MUD_SURFACES.has(surface)) return SURFACE.MUD;
+  return SURFACE.TRACK;
 }
 
 export function roadColorFromTags(tags, classColor = ROAD_CLASSES[tags?.highway]?.color) {
@@ -149,19 +162,49 @@ export function roadWidthFromTags(tags, classWidth) {
   };
 }
 
-function decimate(pts, minDist) {
-  if (pts.length < 3) return pts;
+function finiteOsmId(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function enabledOsmStructure(value) {
+  if (typeof value !== 'string') return value === true || value === 1;
+  const normalized = value.trim().toLowerCase();
+  return !!normalized && normalized !== 'no' && normalized !== 'false' && normalized !== '0';
+}
+
+function osmLayer(tags) {
+  const normalized = typeof tags?.layer === 'number'
+    ? String(tags.layer)
+    : typeof tags?.layer === 'string' ? tags.layer.trim() : '';
+  if (/^-?\d+$/.test(normalized)) {
+    const value = Number(normalized);
+    if (Number.isInteger(value) && value >= -10 && value <= 10) return value;
+  }
+  if (enabledOsmStructure(tags?.bridge)) return 1;
+  if (enabledOsmStructure(tags?.tunnel)) return -1;
+  return 0;
+}
+
+function decimate(pts, nodeIds, minDist, preservedNodeIds = new Set()) {
+  if (pts.length < 3) return { points: pts, nodeIds };
   const out = [pts[0]];
+  const outNodeIds = [nodeIds[0]];
   for (let i = 1; i < pts.length; i++) {
     const prev = out[out.length - 1];
     const dx = pts[i][0] - prev[0];
     const dz = pts[i][1] - prev[1];
-    if (dx * dx + dz * dz >= minDist * minDist) out.push(pts[i]);
+    if (dx * dx + dz * dz >= minDist * minDist || preservedNodeIds.has(nodeIds[i])) {
+      out.push(pts[i]);
+      outNodeIds.push(nodeIds[i]);
+    }
   }
   const last = pts[pts.length - 1];
   const tail = out[out.length - 1];
-  if (tail[0] !== last[0] || tail[1] !== last[1]) out.push(last);
-  return out;
+  if (tail[0] !== last[0] || tail[1] !== last[1]) {
+    out.push(last);
+    outNodeIds.push(nodeIds[nodeIds.length - 1]);
+  }
+  return { points: out, nodeIds: outNodeIds };
 }
 
 export function parseMapData(json) {
@@ -183,6 +226,19 @@ export function parseMapData(json) {
     (centerLat - lat) * 110574
   ];
 
+  const nodeUseCounts = new Map();
+  for (const el of json.elements) {
+    if (el.type !== 'way' || !el.tags?.highway || !ROAD_CLASSES[el.tags.highway] ||
+      !Array.isArray(el.nodes)) continue;
+    for (const value of el.nodes) {
+      const nodeId = finiteOsmId(value);
+      if (nodeId !== null) nodeUseCounts.set(nodeId, (nodeUseCounts.get(nodeId) || 0) + 1);
+    }
+  }
+  const sharedNodeIds = new Set(
+    [...nodeUseCounts].filter(([, count]) => count > 1).map(([nodeId]) => nodeId)
+  );
+
   const roads = [];
   const places = [];
   for (const el of json.elements) {
@@ -192,9 +248,18 @@ export function parseMapData(json) {
       const measuredWidth = roadWidthFromTags(el.tags, cls.width);
       const surface = normalizeRoadSurface(el.tags.surface);
       const isUnpaved = roadIsUnpaved(el.tags);
-      const pts = decimate(el.geometry.map((g) => toLocal(g.lon, g.lat)), 2);
+      const driveSurface = roadDriveSurface(el.tags);
+      const sourcePoints = el.geometry.map((g) => toLocal(g.lon, g.lat));
+      const sourceNodeIds = Array.isArray(el.nodes) && el.nodes.length === sourcePoints.length
+        ? el.nodes.map(finiteOsmId)
+        : sourcePoints.map(() => null);
+      const decimated = decimate(sourcePoints, sourceNodeIds, 2);
+      const profiled = decimate(sourcePoints, sourceNodeIds, 2, sharedNodeIds);
+      const pts = decimated.points;
       if (pts.length < 2) continue;
-      roads.push({
+      const road = {
+        osmId: finiteOsmId(el.id),
+        nodeIds: decimated.nodeIds,
         cls: el.tags.highway,
         name: normalizeRoadName(el.tags.name),
         width: measuredWidth.width,
@@ -204,11 +269,20 @@ export function parseMapData(json) {
         y: cls.y,
         color: roadColorFromTags(el.tags, cls.color),
         priority: cls.priority,
+        layer: osmLayer(el.tags),
+        bridge: enabledOsmStructure(el.tags.bridge),
+        tunnel: enabledOsmStructure(el.tags.tunnel),
         isTrack: !!cls.isTrack,
         isUnpaved,
         surface,
+        driveSurface,
         points: pts
-      });
+      };
+      if (profiled.points.length !== decimated.points.length) {
+        road.profilePoints = profiled.points;
+        road.profileNodeIds = profiled.nodeIds;
+      }
+      roads.push(road);
     } else if (el.type === 'node' && el.tags && el.tags.name && el.tags.place) {
       const [x, z] = toLocal(el.lon, el.lat);
       places.push({ name: el.tags.name, x, z, place: el.tags.place });

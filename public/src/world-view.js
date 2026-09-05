@@ -1,9 +1,9 @@
 export const WORLD_HORIZON_COLOR = 0x162235;
 
 export const DEFAULT_WORLD_VIEW = Object.freeze({
-  fogNear: 1800,
-  fogFar: 8000,
-  cameraFar: 12000
+  fogNear: 3200,
+  fogFar: 18000,
+  cameraFar: 20000
 });
 
 function roundToHundred(value) {
@@ -22,8 +22,8 @@ export function worldViewForBounds(bounds) {
   }
 
   const diagonal = Math.hypot(width, depth);
-  const cameraFar = clamp(roundToHundred(diagonal * 0.7), 8000, 16000);
-  const fogFar = clamp(roundToHundred(cameraFar * 0.75), 6000, cameraFar - 1000);
-  const fogNear = clamp(roundToHundred(fogFar * 0.2), 1200, 2500);
+  const cameraFar = clamp(roundToHundred(diagonal * 1.05), 12000, 24000);
+  const fogFar = clamp(roundToHundred(cameraFar * 0.9), 9000, cameraFar - 1000);
+  const fogNear = clamp(roundToHundred(fogFar * 0.18), 1600, 3500);
   return { fogNear, fogFar, cameraFar };
 }
